@@ -106,6 +106,35 @@ model = FairinoQPModel(left_frame="left_flange", right_frame="right_flange")
 - 腿部 `j20/j19` 在直立时就处在下限 0，所以直立姿态本身在关节限位上；
 - 只检查手臂与躯干/底盘的碰撞，不检查手臂与腿部连杆的碰撞。
 
+## 家位姿态（零空间姿态任务）
+
+7 轴手臂做 6 维末端任务，每条臂有 1 个冗余自由度；躯干参与时再多 5 个。只靠"从上一帧解出发"，
+冗余自由度会随路径漂移（实测躯干模式绕一圈后关节偏离 110°）。设一个家位姿态 `posture_target`
+并令 `posture_weight > 0` 后：
+
+- 冗余自由度在末端任务的**零空间**里被拉向家位，末端位姿不受影响（无残差偏置）；
+- 每次求解仍从 seed（上一帧结果）出发，保持连续；
+- 目标在家位末端附近时，解就落在家位关节角上。实测从扰动 15° 左右的初值出发，回到家位的
+  关节误差 < 1e-4 rad；沿 0.1 m 的圈跟踪一周，最大偏离 16°，回到起点后与家位一致；
+- 每次求解迭代到姿态步长 < `posture_tolerance`（默认 1e-4 rad）为止；
+  `result.posture_residual` 是剩余的零空间姿态偏差，被限位/避碰挡住时不为 0；
+- 躯干模式下，启用姿态任务后，手臂到位以后还会放开躯干，把躯干也拉回家位（手保持不动）。
+
+```python
+home = np.radians([-30, 45, 0, 60, 0, 0, 0,  30, 45, 0, 60, 0, 0, 0,  30, 60, 30, 0, 0])
+model = FairinoQPModel(active_torso=True)
+options = IKOptions(posture_weight=1.0, posture_target=home)
+result = model.solve_ik(left_target, right_target, previous_q, options)
+```
+
+Qt 默认把初始关节值作为家位（`--posture-weight 0` 关闭），IK 页有 "Set home = current joints"
+和 "Go home" 两个按钮；`--home-q` 用度给出家位（14 个，或含躯干的 19 个），同时作为初始位形：
+
+```bash
+fairino-ik-qt --active-torso    # 默认家位就是上面的初始位形
+fairino-ik-qt --active-torso --home-q 0 45 0 90 0 45 0  0 45 0 90 0 45 0  0 0 0 0 0
+```
+
 ## 躯干避碰
 
 与 tron2-ik 的中心立柱避碰对应，这里检查手臂和机身之间的碰撞：
@@ -185,7 +214,9 @@ python examples/dual_arm_qt.py --active-torso     # IK 同时求解躯干
 - 左右末端各自的 XYZ 和旋转目标滑动条。旋转滑条 `rot x/y/z` 是绕世界固定轴、
   相对上次 FK 同步姿态的旋转向量（度），没有万向锁；绝对 RPY 只做显示
   （在 pitch=±90°，即工具竖直时，RPY 本身是奇异的）；
-- 默认初始位形为 `[0, 45, 0, 90, 0, 45, 0]`°（双手在身前）。全零位是双臂伸直的奇异位形
+- 默认初始位形（也是默认家位）：左臂 `[-30, 45, 0, 60, 0, 0, 0]`°、右臂 `[30, 45, 0, 60, 0, 0, 0]`°、
+  躯干 `j20 j19 j18 j16 j15 = [30, 60, 30, 0, 0]`°。仅手臂模式下躯干锁定在这个角度。
+  可用 `--home-q`/`--initial-q`/`--torso` 覆盖。全零位是双臂伸直的奇异位形
   （j1/j3/j5 共线，雅可比秩只有 4），不适合作为拖动起点；
 - `Solve left`、`Solve right` 和 `Solve both`；
 - 原生 C++ QP solver 状态与躯干间距；

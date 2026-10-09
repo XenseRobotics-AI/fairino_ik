@@ -12,7 +12,7 @@ PYBIND11_MODULE(_native, module) {
   OPTION(step_size); OPTION(max_step_norm); OPTION(tolerance);
   OPTION(position_tolerance); OPTION(orientation_tolerance);
   OPTION(position_cost); OPTION(orientation_cost); OPTION(frame_gain);
-  OPTION(posture_weight); OPTION(posture_gain); OPTION(posture_target);
+  OPTION(posture_weight); OPTION(posture_gain); OPTION(posture_target); OPTION(posture_tolerance);
   OPTION(default_velocity_limit); OPTION(torso_velocity_limit); OPTION(torso_step_weight); OPTION(arms_first_iterations);
   OPTION(body_avoidance); OPTION(body_activation_distance); OPTION(body_min_distance);
   OPTION(body_link_radius); OPTION(body_avoidance_weight); OPTION(body_avoidance_gain);
@@ -25,7 +25,7 @@ PYBIND11_MODULE(_native, module) {
   RESULT(left_position_error); RESULT(right_position_error);
   RESULT(left_orientation_error); RESULT(right_orientation_error);
   RESULT(body_collision_free); RESULT(body_min_distance); RESULT(body_nearest_segment);
-  RESULT(status); RESULT(message);
+  RESULT(posture_residual); RESULT(status); RESULT(message);
 #undef RESULT
   py::class_<fairino_ik::Model>(module, "Model", py::module_local())
       .def(py::init<const std::string&, const std::string&, const std::string&, bool>(),

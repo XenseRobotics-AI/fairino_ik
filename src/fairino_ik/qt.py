@@ -18,7 +18,13 @@ Examples::
     python examples/dual_arm_qt.py --no-meshcat
     python examples/dual_arm_qt.py --active-torso    # IK also moves the torso
     python examples/dual_arm_qt.py \
-        --initial-q 0 45 0 90 0 45 0  0 45 0 90 0 45 0
+        --home-q 0 45 0 90 0 45 0  0 45 0 90 0 45 0  0 0 0 0 0
+
+Without --home-q/--initial-q the window starts at
+-30 45 0 60 0 0 0  30 45 0 60 0 0 0 (arms) with the torso at 30 60 30 0 0 deg.
+The initial configuration is also the home posture: the redundant joints are
+pulled towards it in the null space of the hand targets (``--posture-weight 0``
+disables this).  "Set home" stores the current joints as the new home.
 
 For a headless construction check, use ``QT_QPA_PLATFORM=offscreen`` together
 with ``--no-show``.  A normal desktop session is required for interaction.
@@ -340,10 +346,11 @@ class _PosePanel:
         )
 
 
-# Zero is singular: every arm is stretched with j1/j3/j5 collinear, so the
-# Jacobian has rank 4 and some target rotations cannot be followed.  Start
-# with bent elbows and wrists (hands in front of the body) instead.
-_READY_Q_DEG = (0.0, 45.0, 0.0, 90.0, 0.0, 45.0, 0.0) * 2
+# Start (and default home) pose in degrees: left j1..j7, right j8..j14 and
+# torso j20, j19, j18, j16, j15.  Zero would be singular (every arm stretched
+# with j1/j3/j5 collinear), so the arms start bent with the torso leaning in.
+_START_ARMS_DEG = (-30.0, 45.0, 0.0, 60.0, 0.0, 0.0, 0.0, 30.0, 45.0, 0.0, 60.0, 0.0, 0.0, 0.0)
+_START_TORSO_DEG = (30.0, 60.0, 30.0, 0.0, 0.0)
 
 
 _TORSO_LABELS = (
@@ -387,6 +394,8 @@ class FairinoIKWindow:
                     np.asarray(initial_q, dtype=float).reshape(model.nq),
                     model.joint_limits[:, 0], model.joint_limits[:, 1],
                 )
+                if self.options.posture_weight > 0.0 and self.options.posture_target is None:
+                    self.options = replace(self.options, posture_target=self.goal_q.copy())
                 self.display_q = self.goal_q.copy()
                 self._animation_start = self.display_q.copy()
                 self._animation_started = time.monotonic()
@@ -510,6 +519,16 @@ class FairinoIKWindow:
                 solve_right = self.qt["QPushButton"]("Solve right arm")
                 solve_both = self.qt["QPushButton"]("Solve both arms")
                 sync = self.qt["QPushButton"]("Sync targets from current FK")
+                home_buttons = self.qt["QHBoxLayout"]()
+                set_home = self.qt["QPushButton"]("Set home = current joints")
+                go_home = self.qt["QPushButton"]("Go home")
+                set_home.clicked.connect(self._set_home)
+                go_home.clicked.connect(self._go_home)
+                home_buttons.addWidget(set_home)
+                home_buttons.addWidget(go_home)
+                self.home_label = self.qt["QLabel"]()
+                self.home_label.setWordWrap(True)
+                self.home_label.setStyleSheet("font-family: monospace;")
                 solve_left.clicked.connect(lambda: self._solve("left"))
                 solve_right.clicked.connect(lambda: self._solve("right"))
                 solve_both.clicked.connect(lambda: self._solve("both"))
@@ -519,6 +538,9 @@ class FairinoIKWindow:
                 ik_buttons.addWidget(solve_both)
                 ik_buttons.addWidget(sync)
                 ik_layout.addLayout(ik_buttons)
+                ik_layout.addLayout(home_buttons)
+                ik_layout.addWidget(self.home_label)
+                self._update_home_label()
                 self.ik_status = self.qt["QLabel"]()
                 self.ik_status.setWordWrap(True)
                 self.ik_status.setStyleSheet("font-family: monospace;")
@@ -716,6 +738,31 @@ class FairinoIKWindow:
                     self.ik_status.setText(f"IK failed: {exc}")
                     self.ik_status.setStyleSheet("font-family: monospace; color: #b00020;")
 
+            def _update_home_label(self) -> None:
+                if self.options.posture_weight <= 0.0:
+                    self.home_label.setText("Home posture: disabled (--posture-weight 0)")
+                    return
+                home = self.options.posture_target
+                self.home_label.setText(
+                    "Home posture (null-space pull) [deg] = "
+                    + np.array2string(np.degrees(home), precision=1, suppress_small=True)
+                )
+
+            def _set_home(self) -> None:
+                self.options = replace(
+                    self.options,
+                    posture_target=self.goal_q.copy(),
+                    posture_weight=self.options.posture_weight or 1.0,
+                )
+                self._update_home_label()
+
+            def _go_home(self) -> None:
+                if self.options.posture_target is None:
+                    return
+                self._set_goal(np.asarray(self.options.posture_target, dtype=float))
+                self._sync_targets()
+                self.ik_status.setText("Moved to the home posture.")
+
             def _open_meshcat(self) -> None:
                 if self.visualizer is not None:
                     qt["QDesktopServices"].openUrl(qt["QUrl"](str(self.visualizer.url)))
@@ -735,15 +782,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-iterations", type=int, default=500)
     parser.add_argument("--tolerance", type=float, default=1e-5)
     parser.add_argument("--damping", type=float, default=1e-5)
-    parser.add_argument("--posture-cost", type=float, default=0.0)
+    parser.add_argument(
+        "--posture-weight", "--posture-cost", dest="posture_weight", type=float, default=1.0,
+        help="null-space pull towards the home posture (0 disables)",
+    )
+    parser.add_argument("--posture-gain", type=float, default=1.0)
+    parser.add_argument(
+        "--home-q", type=float, nargs="+", metavar="DEG", default=None,
+        help="home posture in degrees: 14 arm joints, or 19 with the torso "
+        + " ".join(TORSO_JOINTS) + "; also the initial pose unless --initial-q is given",
+    )
     parser.add_argument(
         "--velocity-limit", type=float, default=float(np.pi),
         help="arm joint speed in rad/s (the URDF limits are zero)",
     )
     parser.add_argument(
         "--torso", type=float, nargs=len(TORSO_JOINTS), metavar="RAD",
-        default=[0.0] * len(TORSO_JOINTS),
-        help="initial locked torso joints " + " ".join(TORSO_JOINTS) + " (radians)",
+        default=None,
+        help="initial torso joints " + " ".join(TORSO_JOINTS)
+        + " in radians (default: 30 60 30 0 0 deg)",
     )
     parser.add_argument("--head", type=float, default=0.0, help="initial head yaw j17 (radians)")
     parser.add_argument("--no-body-avoidance", action="store_true")
@@ -772,6 +829,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> int:
     qt = _load_qt()
+    if args.torso is None:
+        args.torso = [float(value) for value in np.radians(_START_TORSO_DEG)]
     try:
         model = FairinoQPModel(
             args.urdf, left_frame=args.left_frame, right_frame=args.right_frame,
@@ -788,7 +847,8 @@ def run(args: argparse.Namespace) -> int:
             max_iterations=args.max_iterations,
             tolerance=args.tolerance,
             damping=args.damping,
-            posture_weight=args.posture_cost,
+            posture_weight=args.posture_weight,
+            posture_gain=args.posture_gain,
             dt=1.0 / args.ik_update_hz,
             default_velocity_limit=args.velocity_limit,
             body_avoidance=not args.no_body_avoidance,
@@ -803,14 +863,31 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError("--ik-update-hz must be positive")
         if not np.isfinite(args.smooth_time) or args.smooth_time < 0:
             raise ValueError("--smooth-time must be non-negative")
-        initial_q = np.radians(
-            _READY_Q_DEG if args.initial_q is None else np.asarray(args.initial_q, dtype=float)
-        )
+        torso = np.asarray(args.torso, dtype=float)
+        home_q = None
+        if args.home_q is not None:
+            home_deg = np.asarray(args.home_q, dtype=float)
+            if home_deg.shape not in ((14,), (19,)) or not np.isfinite(home_deg).all():
+                raise ValueError("--home-q must contain 14 or 19 finite degree values")
+            if home_deg.shape == (19,):
+                torso = np.radians(home_deg[14:])
+            home_q = np.radians(home_deg[:14])
+        if args.initial_q is not None:
+            initial_q = np.radians(np.asarray(args.initial_q, dtype=float))
+        else:
+            initial_q = home_q if home_q is not None else np.radians(_START_ARMS_DEG)
         if initial_q.shape != (14,) or not np.isfinite(initial_q).all():
             raise ValueError("--initial-q must contain 14 finite degree values")
         if model.active_torso:
-            initial_q = np.concatenate((initial_q, np.asarray(args.torso, dtype=float)))
+            initial_q = np.concatenate((initial_q, torso))
+            if home_q is not None:
+                home_q = np.concatenate((home_q, torso))
+        else:
+            options = replace(options, torso_position=tuple(float(value) for value in torso))
         initial_q = np.clip(initial_q, model.joint_limits[:, 0], model.joint_limits[:, 1])
+        if home_q is not None and options.posture_weight > 0.0:
+            home_q = np.clip(home_q, model.joint_limits[:, 0], model.joint_limits[:, 1])
+            options = replace(options, posture_target=home_q)
     except Exception as exc:
         print(f"Could not initialize Fairino model: {exc}", file=sys.stderr)
         return 1

@@ -15,6 +15,7 @@
 #include <pinocchio/algorithm/model.hpp>
 #include <pinocchio/parsers/urdf.hpp>
 #include <pinocchio/spatial/explog.hpp>
+#include <Eigen/SVD>
 
 namespace fairino_ik {
 namespace {
@@ -437,7 +438,7 @@ void Model::validateOptions(const Options& options) const {
   }
   if (options.qp_max_iterations < 1) throw std::invalid_argument("qp_max_iterations must be >= 1");
   if (options.arms_first_iterations < 0) throw std::invalid_argument("arms_first_iterations must be >= 0");
-  const std::array<double, 19> values = {
+  const std::array<double, 20> values = {
       options.dt,
       options.damping,
       options.step_size,
@@ -449,6 +450,7 @@ void Model::validateOptions(const Options& options) const {
       options.orientation_cost,
       options.frame_gain,
       options.posture_weight,
+      options.posture_tolerance,
       options.default_velocity_limit,
       options.torso_velocity_limit,
       options.torso_step_weight,
@@ -467,7 +469,7 @@ void Model::validateOptions(const Options& options) const {
   if (options.dt <= 0.0 ||
       options.step_size <= 0.0 || options.max_step_norm <= 0.0 ||
       options.tolerance <= 0.0 || options.default_velocity_limit <= 0.0 ||
-      options.torso_velocity_limit <= 0.0 ||
+      options.torso_velocity_limit <= 0.0 || options.posture_tolerance <= 0.0 ||
       (options.position_cost == 0.0 && options.orientation_cost == 0.0) ||
       options.posture_gain < 0.0 || !finite(options.posture_gain)) {
     throw std::invalid_argument(
@@ -853,13 +855,22 @@ Result Model::solveIKUnlocked(
   Result result;
   PoseErrors errors = evaluate(q, left_target, right_target);
   BodyMetrics body = evaluateBodyAvoidance(options, false, nullptr, nullptr);
-  auto converged = [&]() {
+  const auto targets_reached = [&]() {
     return errors.left_position <= position_tolerance &&
            errors.right_position <= position_tolerance &&
            errors.left_orientation <= orientation_tolerance &&
            errors.right_orientation <= orientation_tolerance &&
            (!options.body_avoidance ||
             body.min_distance >= options.body_min_distance - kClearanceTolerance);
+  };
+  // The posture task lives in the null space of the hand tasks, so it keeps
+  // moving after the targets are reached; it has settled once the steps it
+  // produces are negligible (or it is blocked by limits/collisions).
+  const bool posture_enabled = options.posture_weight > 0.0;
+  double last_step = std::numeric_limits<double>::infinity();
+  const auto converged = [&]() {
+    return targets_reached() &&
+           (!posture_enabled || last_step <= options.posture_tolerance);
   };
   Eigen::Matrix<double, 12, 12> weight =
       Eigen::Matrix<double, 12, 12>::Zero();
@@ -924,9 +935,27 @@ Result Model::solveIKUnlocked(
       FullVector rhs =
           jacobian.transpose() * weight *
           (options.frame_gain * errors.task_error);
-      if (options.posture_weight > 0.0) {
-        hessian.diagonal().array() += options.posture_weight;
-        rhs += options.posture_weight * options.posture_gain * (posture - q);
+      if (posture_enabled) {
+        // Null-space projector of the weighted hand tasks over the active
+        // joints.  Pulling towards the posture only along it leaves the
+        // converged hand poses unbiased.
+        Eigen::Matrix<double, 12, kMaxDof> task = weight.diagonal().cwiseSqrt().asDiagonal() * jacobian;
+        if (!torso_free) {
+          for (int i = kArmDof; i < kMaxDof; ++i) task.col(reduced_q_indices_[i]).setZero();
+        }
+        const Eigen::JacobiSVD<Eigen::Matrix<double, 12, kMaxDof>> svd(task, Eigen::ComputeFullV);
+        const auto& singular = svd.singularValues();
+        const double threshold = 1e-6 * std::max(1.0, singular[0]);
+        FullMatrix null_space = FullMatrix::Identity();
+        for (int k = 0; k < singular.size() && singular[k] > threshold; ++k)
+          null_space -= svd.matrixV().col(k) * svd.matrixV().col(k).transpose();
+        const FullVector pull = null_space * (posture - q);
+        double residual = 0.0;
+        for (int i = 0; i < active; ++i)
+          residual = std::max(residual, std::abs(pull[reduced_q_indices_[i]]));
+        result.posture_residual = residual;
+        hessian.noalias() += options.posture_weight * null_space;
+        rhs.noalias() += options.posture_weight * options.posture_gain * pull;
       }
       for (int i = kArmDof; i < kMaxDof; ++i)
         hessian(reduced_q_indices_[i], reduced_q_indices_[i]) += options.torso_step_weight;
@@ -972,6 +1001,7 @@ Result Model::solveIKUnlocked(
       }
       // Remove the solver's rounding at an active joint limit.
       step = step.cwiseMax(lower).cwiseMin(upper);
+      last_step = step.cwiseAbs().maxCoeff();
       q += step;
       for (int i = 0; i < active; ++i) {
         q[reduced_q_indices_[i]] =
@@ -998,14 +1028,26 @@ Result Model::solveIKUnlocked(
     } else {
       // Arms first: the heavy torso only moves when the arms cannot reach
       // the targets from the current torso pose within a short budget.
+      // A posture target also covers the torso, so its null-space pull
+      // continues with the torso free once the arms have reached.
       const int arm_budget = std::min(options.arms_first_iterations, options.max_iterations);
       if (arm_budget > 0) run_phase(false, arm_budget);
-      if (!result.success && result.iterations < options.max_iterations) {
+      if ((!result.success || posture_enabled) &&
+          result.iterations < options.max_iterations) {
+        result.success = false;
         result.status = "max_iterations";
         result.message.clear();
+        last_step = std::numeric_limits<double>::infinity();
         run_phase(true, options.max_iterations - result.iterations);
       }
     }
+  }
+  if (!result.success && result.status == "max_iterations" && targets_reached()) {
+    // The hands are on target; only the null-space posture ran out of budget.
+    result.success = true;
+    result.status = "converged";
+    result.message = "targets reached; posture still settling after " +
+                     std::to_string(result.iterations) + " iterations";
   }
 
   result.q = reducedToPublic(q);

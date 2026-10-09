@@ -94,7 +94,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--damping", type=float, default=1e-5)
     parser.add_argument("--dt", type=float, default=0.02)
     parser.add_argument("--max-step-norm", type=float, default=0.15)
-    parser.add_argument("--posture-cost", type=float, default=0.0)
+    parser.add_argument(
+        "--posture-weight", "--posture-cost", dest="posture_weight", type=float, default=0.0,
+        help="null-space pull towards --home-q (or the seed); 0 disables",
+    )
+    parser.add_argument(
+        "--home-q", type=float, nargs="+", metavar="DEG", default=None,
+        help="home posture in degrees with the model's nq values (14, or 19 with --active-torso); "
+        "enables --posture-weight 1 unless it is set",
+    )
     parser.add_argument(
         "--velocity-limit", type=float, default=float(np.pi),
         help="arm joint speed in rad/s (the URDF limits are zero)",
@@ -137,7 +145,7 @@ def main() -> int:
         damping=args.damping,
         dt=args.dt,
         max_step_norm=args.max_step_norm,
-        posture_weight=args.posture_cost,
+        posture_weight=args.posture_weight,
         default_velocity_limit=args.velocity_limit,
         body_avoidance=not args.no_body_avoidance,
         torso_step_weight=args.torso_step_weight,
@@ -146,6 +154,10 @@ def main() -> int:
         torso_position=tuple(args.torso),
         head_position=args.head,
     )
+    if args.home_q is not None:
+        options.posture_target = np.radians(np.asarray(args.home_q, dtype=float))
+        if options.posture_weight <= 0.0:
+            options.posture_weight = 1.0
     if args.left_target is None and args.right_target is None:
         # Make the default command a real native QP solve instead of a zero-error
         # no-op by generating two nearby, reachable targets with FK.
@@ -204,6 +216,8 @@ def main() -> int:
     print("arms q [deg]:", np.array2string(np.degrees(result.q[:14]), precision=6))
     if model.active_torso:
         print(f"torso {TORSO_JOINTS} [deg]:", np.array2string(np.degrees(result.q[14:]), precision=6))
+    if options.posture_weight > 0.0:
+        print(f"posture residual [rad]: {result.posture_residual:.3g}")
     if result.message:
         print(f"message: {result.message}")
     if args.print_full_q and result.full_q is not None:

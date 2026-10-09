@@ -45,8 +45,14 @@ struct Options {
   double position_cost = 1.0;
   double orientation_cost = 1.0;
   double frame_gain = 1.0;
+  // Posture task in the null space of the hand tasks: with posture_weight > 0
+  // the redundant joints move towards posture_target without biasing the
+  // hand poses.  posture_gain is the fraction of the remaining null-space
+  // offset removed per iteration; the solve keeps iterating until the
+  // posture steps fall below posture_tolerance (rad).
   double posture_weight = 0.0;
   double posture_gain = 1.0;
+  double posture_tolerance = 1e-4;
   // The exported URDF has velocity="0" on every joint.  These speeds (rad/s)
   // are used for joints without a positive URDF velocity limit.
   double default_velocity_limit = 3.14159265358979323846;
@@ -94,6 +100,8 @@ struct Result {
   double left_orientation_error = 0.0;
   double right_position_error = 0.0;
   double right_orientation_error = 0.0;
+  // Largest remaining null-space posture offset (rad); 0 without a posture task.
+  double posture_residual = 0.0;
   bool body_collision_free = true;
   double body_min_distance = std::numeric_limits<double>::infinity();
   std::string body_nearest_segment;

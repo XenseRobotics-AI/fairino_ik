@@ -129,3 +129,24 @@ def test_qt_active_torso_solves_beyond_arm_reach() -> None:
     assert np.isclose(window.goal_q[18], np.deg2rad(15.0), atol=2e-4)
     assert window.options.torso_position == (0.0,) * 5
     window.close()
+
+
+def test_qt_home_buttons() -> None:
+    qt = _load_qt()
+    app = QApplication.instance() or QApplication([])
+    model = FairinoQPModel(active_torso=True)
+    home = np.radians([-30, 45, 0, 60, 0, 0, 0, 30, 45, 0, 60, 0, 0, 0, 30, 60, 30, 0, 0])
+    window = FairinoIKWindow.create(
+        qt, model, IKOptions(posture_weight=1.0), initial_q=home, visualizer=None,
+        smooth_time=0.0,
+    )
+    assert np.allclose(window.options.posture_target, home)
+    window.left_joints.controls[0].set_value(-10.0)
+    window._apply_fk_from_sliders("left")
+    window._set_home()
+    assert np.isclose(window.options.posture_target[0], np.radians(-10.0), atol=2e-4)
+    window.options = window.options.__class__(**{**window.options.__dict__, "posture_target": home})
+    window._go_home()
+    assert np.allclose(window.goal_q, home)
+    app.processEvents()
+    window.close()

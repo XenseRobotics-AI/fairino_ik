@@ -133,3 +133,49 @@ def test_batch_matches_single_solves(model) -> None:
     assert all(result.success for result in batch)
     assert np.array_equal(batch[0].q, single.q)
     assert batch[1].iterations == single.iterations
+
+
+HOME = np.radians([-30, 45, 0, 60, 0, 0, 0, 30, 45, 0, 60, 0, 0, 0, 30, 60, 30, 0, 0])
+
+
+def test_home_posture_is_recovered_from_a_perturbed_seed(model) -> None:
+    left, right = model.end_effector_poses(HOME)
+    options = IKOptions(posture_weight=1.0, posture_target=HOME)
+    rng = np.random.default_rng(0)
+    for _ in range(3):
+        seed = np.clip(HOME + rng.normal(0.0, 0.25, 19), model.joint_limits[:, 0],
+                       model.joint_limits[:, 1])
+        plain = model.solve_ik(left, right, seed)
+        homed = model.solve_ik(left, right, seed, options)
+        assert plain.success and homed.success, homed.as_dict()
+        assert np.abs(plain.q - HOME).max() > np.radians(5.0)
+        assert np.allclose(homed.q, HOME, atol=1e-4)
+        assert homed.error < 1e-6
+        assert homed.posture_residual < 1e-4
+
+
+def test_home_posture_does_not_bias_the_hands_and_returns_after_a_loop(model) -> None:
+    left, right = model.end_effector_poses(HOME)
+    options = IKOptions(posture_weight=1.0, posture_target=HOME)
+    q = HOME.copy()
+    for t in np.linspace(0.0, 2.0 * np.pi, 40):
+        offset = 0.1 * np.array([np.sin(t), 1.0 - np.cos(t), -np.sin(t)])
+        target_left, target_right = left.copy(), right.copy()
+        target_left[:3, 3] += offset
+        target_right[:3, 3] += offset
+        result = model.solve_ik(target_left, target_right, q, options)
+        assert result.success and result.error < 1e-5, result.as_dict()
+        q = result.q
+    assert np.allclose(q, HOME, atol=1e-4)
+
+
+def test_arm_only_home_posture(model) -> None:
+    arm_only = FairinoQPModel()
+    home = HOME[:14]
+    locked = dict(torso_position=tuple(HOME[14:]))
+    left, right = arm_only.end_effector_poses(home, IKOptions(**locked))
+    seed = home + np.radians([10, -10, 15, 5, -10, 10, 5] * 2)
+    result = arm_only.solve_ik(left, right, seed,
+                               IKOptions(posture_weight=1.0, posture_target=home, **locked))
+    assert result.success
+    assert np.allclose(result.q, home, atol=1e-4)

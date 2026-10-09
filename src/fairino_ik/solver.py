@@ -65,10 +65,18 @@ class IKOptions:
     default x forward, y left, z up, with the origin at ``base_link``
     (see ``DEFAULT_BASE_POSE``).
     Position tolerances and costs use metres; orientation tolerances and costs
-    use radians.  ``posture_target`` follows the model's public order (left
-    seven, right seven, then the torso when it is active).  When posture
-    regularization is enabled without an explicit target, the seed becomes the
-    target so successive solves favour continuous solutions.
+    use radians.
+
+    Posture: with ``posture_weight > 0`` the redundant joints are pulled
+    towards ``posture_target`` (e.g. a home pose) in the null space of the
+    hand tasks, so the hand poses stay exact.  Each solve still starts from
+    the seed (the previous solution), and near the home hand poses the
+    solution settles on the home joint angles.  ``posture_target`` follows the
+    model's public order (left seven, right seven, then the torso when it is
+    active); without it the seed is the target (least joint motion).
+    ``posture_gain`` is the fraction of the remaining null-space offset removed
+    per iteration and ``posture_tolerance`` (rad) the step size below which
+    the posture counts as settled.
 
     In arm-only mode ``torso_position`` (``TORSO_JOINTS`` order) locks the
     torso; it changes where the arms are mounted, so FK, IK and the full
@@ -108,6 +116,7 @@ class IKOptions:
 
     posture_weight: float = 0.0
     posture_gain: float = 1.0
+    posture_tolerance: float = 1e-4
     posture_target: np.ndarray | None = None
 
     qp_solver: str | None = None
@@ -140,7 +149,7 @@ class IKOptions:
             setattr(self, name, value)
 
         positive = ("tolerance", "dt", "max_step_norm", "default_velocity_limit",
-                    "torso_velocity_limit")
+                    "torso_velocity_limit", "posture_tolerance")
         for name in positive:
             value = float(getattr(self, name))
             if not np.isfinite(value) or value <= 0.0:
@@ -226,6 +235,7 @@ class IKResult:
     qp_iterations: int = 0
     qp_active_constraints: int = 0
     solve_time_ms: float = 0.0
+    posture_residual: float = 0.0
     body_collision_free: bool = True
     body_min_distance: float = float("inf")
     body_nearest_segment: str = ""
@@ -266,6 +276,7 @@ class IKResult:
             "qp_iterations": self.qp_iterations,
             "qp_active_constraints": self.qp_active_constraints,
             "solve_time_ms": self.solve_time_ms,
+            "posture_residual": self.posture_residual,
             "body_collision_free": self.body_collision_free,
             "body_min_distance": self.body_min_distance,
             "body_nearest_segment": self.body_nearest_segment,
