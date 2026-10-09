@@ -16,6 +16,7 @@ Examples::
 
     python examples/dual_arm_qt.py
     python examples/dual_arm_qt.py --no-meshcat
+    python examples/dual_arm_qt.py --active-torso    # IK also moves the torso
     python examples/dual_arm_qt.py \
         --initial-q 0 45 0 90 0 45 0  0 45 0 90 0 45 0
 
@@ -383,7 +384,7 @@ class FairinoIKWindow:
                 self._syncing = False
                 self._pending_sides: set[str] = set()
                 self.goal_q = np.clip(
-                    np.asarray(initial_q, dtype=float).reshape(14),
+                    np.asarray(initial_q, dtype=float).reshape(model.nq),
                     model.joint_limits[:, 0], model.joint_limits[:, 1],
                 )
                 self.display_q = self.goal_q.copy()
@@ -452,20 +453,22 @@ class FairinoIKWindow:
                 fk_layout = self.qt["QVBoxLayout"](fk_page)
                 fk_layout.addWidget(self.qt["QLabel"](
                     "FK：拖动左右臂关节滑条；Apply FK 会更新两侧末端目标。"
-                    "躯干/头部在 IK 中锁定，改变后两侧目标随之同步。"
+                    + ("躯干参与 IK 求解，头部锁定；拖动躯干滑条后两侧目标随之同步。"
+                       if model.active_torso else
+                       "躯干/头部在 IK 中锁定，改变后两侧目标随之同步。")
                 ))
                 joint_row = self.qt["QHBoxLayout"]()
                 limits = np.asarray(model.joint_limits, dtype=float)
                 self.left_joints = _JointPanel(qt, "Left arm joints", model.left_arm_joints, limits[:7])
-                self.right_joints = _JointPanel(qt, "Right arm joints", model.right_arm_joints, limits[7:])
+                self.right_joints = _JointPanel(qt, "Right arm joints", model.right_arm_joints, limits[7:14])
                 torso_limits = np.vstack((model.torso_limits, model.head_limits))
                 self.torso_joints = _JointPanel(
-                    qt, "Torso / head (locked during IK)",
+                    qt,
+                    "Torso (solved by IK) / head (locked)" if model.active_torso
+                    else "Torso / head (locked during IK)",
                     TORSO_JOINTS + (HEAD_JOINT,), torso_limits, _TORSO_LABELS,
                 )
-                self.torso_joints.set_q(
-                    tuple(self.options.torso_position) + (self.options.head_position,)
-                )
+                self.torso_joints.set_q(self._torso_values() + (self.options.head_position,))
                 joint_row.addWidget(self.left_joints.widget)
                 joint_row.addWidget(self.right_joints.widget)
                 fk_layout.addLayout(joint_row)
@@ -521,7 +524,7 @@ class FairinoIKWindow:
                 self.ik_status.setStyleSheet("font-family: monospace;")
                 ik_layout.addWidget(self.ik_status)
                 ik_layout.addStretch(1)
-                tabs.addTab(ik_page, "IK - XYZ / RPY sliders")
+                tabs.addTab(ik_page, "IK - XYZ / rotation sliders")
                 root.addWidget(tabs, 1)
                 reset = self.qt["QPushButton"]("Reset targets / sliders")
                 reset.clicked.connect(self._reset_from_q)
@@ -551,7 +554,7 @@ class FairinoIKWindow:
                 self._update_view(self.display_q)
 
             def _set_goal(self, q: np.ndarray, *, immediate: bool = False) -> None:
-                q = np.asarray(q, dtype=float).reshape(14)
+                q = np.asarray(q, dtype=float).reshape(model.nq)
                 if immediate or self.smooth_time <= 0.0:
                     self.goal_q = q.copy()
                     self.display_q = q.copy()
@@ -569,9 +572,18 @@ class FairinoIKWindow:
                 self._syncing = True
                 try:
                     self.left_joints.set_q(self.goal_q[:7])
-                    self.right_joints.set_q(self.goal_q[7:])
+                    self.right_joints.set_q(self.goal_q[7:14])
+                    if model.active_torso:
+                        self.torso_joints.set_q(
+                            self._torso_values() + (self.options.head_position,)
+                        )
                 finally:
                     self._syncing = False
+
+            def _torso_values(self) -> tuple[float, ...]:
+                if model.active_torso:
+                    return tuple(float(value) for value in self.goal_q[14:])
+                return tuple(self.options.torso_position)
 
             def _reset_from_q(self) -> None:
                 self._set_goal(self.goal_q, immediate=True)
@@ -594,17 +606,20 @@ class FairinoIKWindow:
 
             def _apply_torso_from_sliders(self) -> None:
                 values = self.torso_joints.q()
-                self.options = replace(
-                    self.options,
-                    torso_position=tuple(float(value) for value in values[:-1]),
-                    head_position=float(values[-1]),
-                )
+                torso = tuple(float(value) for value in values[:-1])
+                self.options = replace(self.options, head_position=float(values[-1]))
+                if model.active_torso:
+                    q = self.goal_q.copy()
+                    q[14:] = torso
+                    self._set_goal(q, immediate=True)
+                else:
+                    self.options = replace(self.options, torso_position=torso)
                 # The arms keep their joint angles and ride along with the
                 # torso, so the IK targets follow the new FK poses.
                 self._sync_targets()
                 self._update_view(self.display_q)
                 self.fk_status.setText(
-                    "Torso/head locked at [deg] = "
+                    "Torso/head at [deg] = "
                     + np.array2string(np.degrees(values), precision=2, suppress_small=True)
                 )
 
@@ -616,14 +631,11 @@ class FairinoIKWindow:
 
             def _apply_fk_from_sliders(self, side: str | None = None) -> None:
                 self.fk_timer.stop()
-                left = self.left_joints.q()
-                right = self.right_joints.q()
-                if side == "left":
-                    q = np.concatenate((left, self.goal_q[7:]))
-                elif side == "right":
-                    q = np.concatenate((self.goal_q[:7], right))
-                else:
-                    q = np.concatenate((left, right))
+                q = self.goal_q.copy()
+                if side != "right":
+                    q[:7] = self.left_joints.q()
+                if side != "left":
+                    q[7:14] = self.right_joints.q()
                 q = np.clip(q, model.joint_limits[:, 0], model.joint_limits[:, 1])
                 self._set_goal(q, immediate=True)
                 self._syncing = True
@@ -683,13 +695,18 @@ class FairinoIKWindow:
                     )
                     if np.isfinite(result.q).all():
                         self._set_goal(result.q)
+                    torso_text = (
+                        f"torso [deg] = {np.array2string(np.degrees(result.q[14:]), precision=2, suppress_small=True)}\n"
+                        if model.active_torso else ""
+                    )
                     self.ik_status.setText(
+                        torso_text +
                         f"{side} solve: {result.status}, success={result.success}, "
                         f"iterations={result.iterations}\n"
                         f"position={result.position_error:.3e} m, "
                         f"orientation={result.orientation_error:.3e} rad, "
                         f"torso clearance={result.body_min_distance:.3f} m\n"
-                        f"q [deg] = {np.array2string(np.degrees(result.q), precision=2, suppress_small=True)}"
+                        f"arms [deg] = {np.array2string(np.degrees(result.q[:14]), precision=2, suppress_small=True)}"
                     )
                     self.ik_status.setStyleSheet(
                         "font-family: monospace; color: #1b7f2a;"
@@ -731,6 +748,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--head", type=float, default=0.0, help="initial head yaw j17 (radians)")
     parser.add_argument("--no-body-avoidance", action="store_true")
     parser.add_argument(
+        "--active-torso", action="store_true",
+        help="let the IK move the torso too (19 DoF); --torso is then the initial torso",
+    )
+    parser.add_argument(
+        "--arms-first-iterations", type=int, default=50,
+        help="iterations with the torso fixed before it is freed (0: free at once)",
+    )
+    parser.add_argument("--torso-step-weight", type=float, default=0.0)
+    parser.add_argument(
         "--solver",
         default="eiquadprog",
         help="native C++ backend shown initially in the GUI (default: eiquadprog)",
@@ -750,6 +776,7 @@ def run(args: argparse.Namespace) -> int:
         model = FairinoQPModel(
             args.urdf, left_frame=args.left_frame, right_frame=args.right_frame,
             base_pose=URDF_BASE_POSE if args.urdf_base_frame else None,
+            active_torso=args.active_torso,
         )
         available_solvers = _available_qp_solvers()
         if args.solver not in available_solvers:
@@ -765,6 +792,8 @@ def run(args: argparse.Namespace) -> int:
             dt=1.0 / args.ik_update_hz,
             default_velocity_limit=args.velocity_limit,
             body_avoidance=not args.no_body_avoidance,
+            torso_step_weight=args.torso_step_weight,
+            arms_first_iterations=args.arms_first_iterations,
             qp_solver=args.solver,
             torso_position=tuple(args.torso),
             head_position=args.head,
@@ -779,6 +808,8 @@ def run(args: argparse.Namespace) -> int:
         )
         if initial_q.shape != (14,) or not np.isfinite(initial_q).all():
             raise ValueError("--initial-q must contain 14 finite degree values")
+        if model.active_torso:
+            initial_q = np.concatenate((initial_q, np.asarray(args.torso, dtype=float)))
         initial_q = np.clip(initial_q, model.joint_limits[:, 0], model.joint_limits[:, 1])
     except Exception as exc:
         print(f"Could not initialize Fairino model: {exc}", file=sys.stderr)

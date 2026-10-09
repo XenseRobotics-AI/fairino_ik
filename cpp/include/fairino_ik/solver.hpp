@@ -21,9 +21,14 @@ namespace fairino_ik {
 //   torso      j20, j19, j18, j16, j15 (base_link -> body_Link, root first)
 //   head       j17
 //   wheels     j21..j28 (steering + drive, irrelevant to the arms)
+//
+// The public configuration is [left 7 | right 7] in arm-only mode and
+// [left 7 | right 7 | torso 5] when the torso is active, so the arm slices
+// mean the same thing in both modes.
 constexpr int kArmDof = 14;
 constexpr int kTorsoDof = 5;
-constexpr int kBodyBoxCount = 2;  // body_Link and waist_Link
+constexpr int kMaxDof = kArmDof + kTorsoDof;
+constexpr int kBodyBoxCount = 3;  // body_Link, waist_Link and base_link
 constexpr int kArmSamplesPerSide = 13;  // 3 segments * 4 samples + endpoint
 constexpr int kBodySamples = kBodyBoxCount * 2 * kArmSamplesPerSide;
 
@@ -42,12 +47,20 @@ struct Options {
   double frame_gain = 1.0;
   double posture_weight = 0.0;
   double posture_gain = 1.0;
-  // The exported URDF has velocity="0" on every joint.  This speed (rad/s)
-  // is used for any arm joint without a positive URDF velocity limit.
+  // The exported URDF has velocity="0" on every joint.  These speeds (rad/s)
+  // are used for joints without a positive URDF velocity limit.
   double default_velocity_limit = 3.14159265358979323846;
-  // Lightweight self-collision avoidance against the torso.  Boxes fitted
-  // to the body_Link and waist_Link meshes are checked against sampled arm
-  // center lines; each box is inflated by body_link_radius so the samples
+  double torso_velocity_limit = 0.5;
+  // Active-torso mode only.  The solve first tries the arms alone for up to
+  // arms_first_iterations, so the torso stays put whenever the arms can
+  // reach; then it continues with the torso free.  0 frees the torso from
+  // the start.  torso_step_weight is an extra quadratic cost on each torso
+  // step in that phase; it slows convergence near arm singularities.
+  int arms_first_iterations = 50;
+  double torso_step_weight = 0.0;
+  // Lightweight self-collision avoidance.  Boxes fitted to the body_Link,
+  // waist_Link and base_link meshes are checked against sampled arm center
+  // lines; each box is inflated by body_link_radius so the samples
   // approximate capsules.
   bool body_avoidance = true;
   double body_activation_distance = 0.04;
@@ -55,11 +68,12 @@ struct Options {
   double body_link_radius = 0.06;
   double body_avoidance_weight = 4.0;
   double body_avoidance_gain = 1.0;
-  // Optional public-order (left seven, right seven) posture target.  An
-  // empty vector means that the seed is used when posture regularization is
-  // enabled without an explicit target.
+  // Optional public-order posture target with nq values.  An empty vector
+  // means that the seed is used when posture regularization is enabled
+  // without an explicit target.
   std::vector<double> posture_target;
-  // Locked during IK: j20, j19, j18, j16, j15 and the head yaw j17.
+  // Arm-only mode locks j20, j19, j18, j16, j15 here; active-torso mode
+  // takes them from q instead.  The head yaw j17 is always locked.
   std::array<double, kTorsoDof> torso_position{};
   double head_position = 0.0;
 };
@@ -92,14 +106,18 @@ class Model {
   explicit Model(
       const std::string& urdf_path,
       const std::string& left_frame = "left_waist2_Link",
-      const std::string& right_frame = "right_waist2_Link");
+      const std::string& right_frame = "right_waist2_Link",
+      bool active_torso = false);
   Model(const std::string& urdf_path, const std::string& left_frame,
-        const std::string& right_frame, const std::array<double, 16>& base_pose);
+        const std::string& right_frame, const std::array<double, 16>& base_pose,
+        bool active_torso = false);
 
-  int nq() const noexcept { return kArmDof; }
-  int nv() const noexcept { return kArmDof; }
+  int nq() const noexcept { return nq_; }
+  int nv() const noexcept { return nq_; }
+  bool activeTorso() const noexcept { return active_torso_; }
   int fullNq() const noexcept { return full_model_.nq; }
   int fullNv() const noexcept { return full_model_.nv; }
+  std::vector<std::string> jointNames() const;
   std::vector<std::array<double, 2>> jointLimits() const;
   std::vector<std::array<double, 2>> torsoLimits() const;
   std::array<double, 2> headLimits() const;
@@ -112,7 +130,7 @@ class Model {
       const std::vector<double>& q, const Options& options);
 
   std::vector<double> forwardKinematics(
-      const std::vector<double>& q_arm, const std::string& side,
+      const std::vector<double>& q, const std::string& side,
       const Options& options = Options{});
 
   Result solveIK(
@@ -128,11 +146,25 @@ class Model {
       const Options& options);
 
  private:
+  using FullVector = Eigen::Matrix<double, kMaxDof, 1>;
+  using FullMatrix = Eigen::Matrix<double, kMaxDof, kMaxDof>;
+  using ConstraintMatrix = Eigen::Matrix<double, kBodySamples, kMaxDof>;
+  using ConstraintVector = Eigen::Matrix<double, kBodySamples, 1>;
+
   Result solveIKUnlocked(
       const std::array<double, 16>& left_target,
       const std::array<double, 16>& right_target,
       const std::vector<double>& q_seed,
       const Options& options);
+  // Solves the step QP over the first N public joints.  All inputs use the
+  // reduced-model coordinate order; inactive columns are dropped.
+  template <int N>
+  eiquadprog::solvers::RtEiquadprog_status solveActiveQP(
+      BoxQP<N, kBodySamples>& qp, const FullMatrix& hessian,
+      const FullVector& gradient, const FullVector& lower,
+      const FullVector& upper, const ConstraintMatrix& constraints,
+      const ConstraintVector& offsets, int max_iterations, FullVector& step,
+      int* iterations, int* active_constraints);
   void addFlangeFrames();
   void configureReducedModel(const Options& options);
   Eigen::VectorXd fullConfigurationImpl(const std::vector<double>& q,
@@ -140,10 +172,14 @@ class Model {
   struct Mimic { int child; int parent; double multiplier; double offset; };
   std::vector<Mimic> mimic_;  // Topologically ordered at construction.
   std::string left_frame_name_, right_frame_name_;
-  std::array<double, kTorsoDof + 1> fixed_coordinates_{};
+  double fixed_head_position_ = 0.0;
   bool reduced_initialized_ = false;
-  Eigen::VectorXd armToReduced(const std::vector<double>& q_arm) const;
-  std::vector<double> reducedToArm(const Eigen::VectorXd& q_reduced) const;
+  // Public torso values: from q when active, else from the options.
+  double torsoValue(const std::vector<double>& q, const Options& options,
+                    int index) const;
+  Eigen::VectorXd toReduced(const std::vector<double>& q,
+                            const Options& options) const;
+  std::vector<double> reducedToPublic(const Eigen::VectorXd& q_reduced) const;
   Eigen::Isometry3d poseFromArray(const std::array<double, 16>& values) const;
   std::array<double, 16> poseToArray(const Eigen::Isometry3d& pose) const;
   Eigen::Isometry3d framePose(const Eigen::VectorXd& q, pinocchio::FrameIndex frame);
@@ -172,11 +208,14 @@ class Model {
       const Eigen::Isometry3d& right_target);
   BodyMetrics evaluateBodyAvoidance(
       const Options& options,
-      Eigen::Matrix<double, kArmDof, kArmDof>* hessian,
-      Eigen::Matrix<double, kArmDof, 1>* rhs,
-      Eigen::Matrix<double, kBodySamples, kArmDof>* constraints = nullptr,
-      Eigen::Matrix<double, kBodySamples, 1>* offsets = nullptr);
+      bool torso_free,
+      FullMatrix* hessian,
+      FullVector* rhs,
+      ConstraintMatrix* constraints = nullptr,
+      ConstraintVector* offsets = nullptr);
 
+  bool active_torso_ = false;
+  int nq_ = kArmDof;
   pinocchio::Model full_model_;
   pinocchio::Data full_data_;
   pinocchio::Model reduced_model_;
@@ -186,21 +225,23 @@ class Model {
   std::array<std::array<pinocchio::FrameIndex, 4>, 2> body_arm_frame_ids_{};
   std::array<pinocchio::FrameIndex, kBodyBoxCount> body_box_frame_ids_{};
   Eigen::Isometry3d base_pose_{Eigen::Isometry3d::Identity()};
-  std::array<std::string, kArmDof> arm_joint_names_{{
+  // Public order: left arm, right arm, torso (root first).
+  std::array<std::string, kMaxDof> joint_names_{{
       "j1", "j2", "j3", "j4", "j5", "j6", "j7",
       "j8", "j9", "j10", "j11", "j12", "j13", "j14",
-  }};
-  std::array<std::string, kTorsoDof> torso_joint_names_{{
       "j20", "j19", "j18", "j16", "j15",
   }};
   std::string head_joint_name_ = "j17";
-  std::array<int, kArmDof> arm_q_indices_{};
-  std::array<double, kArmDof> lower_limits_{};
-  std::array<double, kArmDof> upper_limits_{};
-  // Raw URDF values; zero means "use Options::default_velocity_limit".
-  std::array<double, kArmDof> urdf_velocity_limits_{};
-  std::array<int, kArmDof> full_q_indices_{};
-  BoxQP<kArmDof, kBodySamples> qp_;
+  // Public index -> reduced-model coordinate.  The reduced model always
+  // contains all 19 joints; arm-only mode fixes the torso coordinates.
+  std::array<int, kMaxDof> reduced_q_indices_{};
+  std::array<double, kMaxDof> lower_limits_{};
+  std::array<double, kMaxDof> upper_limits_{};
+  // Raw URDF values; zero means "use the Options fallback speed".
+  std::array<double, kMaxDof> urdf_velocity_limits_{};
+  std::array<int, kMaxDof> full_q_indices_{};
+  BoxQP<kArmDof, kBodySamples> arm_qp_;
+  BoxQP<kMaxDof, kBodySamples> torso_qp_;
   mutable std::mutex mutex_;
 };
 

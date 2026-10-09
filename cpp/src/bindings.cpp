@@ -13,7 +13,7 @@ PYBIND11_MODULE(_native, module) {
   OPTION(position_tolerance); OPTION(orientation_tolerance);
   OPTION(position_cost); OPTION(orientation_cost); OPTION(frame_gain);
   OPTION(posture_weight); OPTION(posture_gain); OPTION(posture_target);
-  OPTION(default_velocity_limit);
+  OPTION(default_velocity_limit); OPTION(torso_velocity_limit); OPTION(torso_step_weight); OPTION(arms_first_iterations);
   OPTION(body_avoidance); OPTION(body_activation_distance); OPTION(body_min_distance);
   OPTION(body_link_radius); OPTION(body_avoidance_weight); OPTION(body_avoidance_gain);
   OPTION(torso_position); OPTION(head_position);
@@ -28,10 +28,17 @@ PYBIND11_MODULE(_native, module) {
   RESULT(status); RESULT(message);
 #undef RESULT
   py::class_<fairino_ik::Model>(module, "Model", py::module_local())
-      .def(py::init<const std::string&, const std::string&, const std::string&>())
-      .def(py::init<const std::string&, const std::string&, const std::string&, const std::array<double, 16>&>())
+      .def(py::init<const std::string&, const std::string&, const std::string&, bool>(),
+           py::arg("urdf_path"), py::arg("left_frame"), py::arg("right_frame"),
+           py::arg("active_torso") = false)
+      .def(py::init<const std::string&, const std::string&, const std::string&,
+                    const std::array<double, 16>&, bool>(),
+           py::arg("urdf_path"), py::arg("left_frame"), py::arg("right_frame"),
+           py::arg("base_pose"), py::arg("active_torso") = false)
       .def_property_readonly("nq", &fairino_ik::Model::nq)
       .def_property_readonly("nv", &fairino_ik::Model::nv)
+      .def_property_readonly("active_torso", &fairino_ik::Model::activeTorso)
+      .def_property_readonly("joint_names", &fairino_ik::Model::jointNames)
       .def_property_readonly("full_nq", &fairino_ik::Model::fullNq)
       .def_property_readonly("full_nv", &fairino_ik::Model::fullNv)
       .def_property_readonly("joint_limits", &fairino_ik::Model::jointLimits)

@@ -25,13 +25,21 @@ Python 只提供接口、CLI 和 Qt；FK、雅可比、约束 QP 和迭代全部
 
 注意 URDF 中的 `left/right_waist1/2_Link` 实际是腕部连杆，不是腰。
 
-IK 只求解两条七轴手臂，公开配置向量固定为 14 维：左臂 `j1..j7` 再右臂 `j8..j14`。
-躯干、头部和轮子在求解时锁定：
+IK 有两种模式（构造模型时选择）：
 
-- `IKOptions.torso_position`：按 `j20, j19, j18, j16, j15` 顺序的 5 个角度（弧度），默认全 0（直立）；
+| 模式 | 构造 | 公开 q（`model.nq`） |
+| --- | --- | --- |
+| 仅手臂（默认） | `FairinoQPModel()` | 14 维：左臂 `j1..j7`、右臂 `j8..j14` |
+| 手臂 + 躯干 | `FairinoQPModel(active_torso=True)` | 19 维：左臂 7、右臂 7、躯干 `j20 j19 j18 j16 j15` |
+
+两种模式下 `q[:7]`、`q[7:14]` 含义相同；`model.split_q(q)` 返回 `(left, right, torso)`。
+头部和轮子始终锁定：
+
+- `IKOptions.torso_position`：仅手臂模式下躯干锁定的 5 个角度（弧度），默认全 0（直立）；
+  手臂 + 躯干模式下躯干取自 q，此项被忽略；
 - `IKOptions.head_position`：`j17` 头部偏航（弧度）。
 
-躯干角度会改变手臂安装位置，因此 FK、IK、`full_q` 和 MeshCat 显示都使用同一组锁定值。
+躯干角度会改变手臂安装位置，因此 FK、IK、`full_q` 和 MeshCat 显示都使用同一组躯干值。
 完整 Pinocchio 配置为 `nq=32, nv=28`（四个 continuous 驱动轮各占 cos/sin 两个坐标）。
 
 ## 坐标与末端帧
@@ -62,25 +70,57 @@ model = FairinoQPModel(left_frame="left_flange", right_frame="right_flange")
 ## 与原 URDF 不同的约定
 
 - URDF 中所有关节 `velocity="0"`。QP 每步的速度边界改用
-  `IKOptions.default_velocity_limit`（默认 π rad/s），仅对 URDF 速度不为正的关节生效。
+  `IKOptions.default_velocity_limit`（手臂，默认 π rad/s）和 `torso_velocity_limit`
+  （躯干，默认 0.5 rad/s），仅对 URDF 速度不为正的关节生效。
 - URDF 网格路径从 `package://fairino_wheel_legged_robot_description/meshes/` 改为相对路径
   `meshes/`，其余内容与原文件一致。
 - URDF 中 `j11`（右臂肘）的上限为 `2.9548`，而左臂对应的 `j4` 为 `1.9548`，疑似导出笔误；
   本项目按原值使用，未做修改。
 
+## 手臂 + 躯干 IK
+
+`FairinoQPModel(active_torso=True)` 让 IK 同时求解躯干 5 轴：腿部 `j20/j19/j18`
+（三根轴都平行于 y，在矢状面内负责躯干高度、前后位置和俯仰）、侧倾 `j16`、偏航 `j15`。
+目标仍是两只手的世界位姿，躯干只是多出来的自由度，用来扩大可达范围（下蹲、前探、转身）。
+
+求解策略是**手臂优先**，分两段：
+
+1. 先固定躯干，只用手臂迭代最多 `arms_first_iterations` 次（默认 50；
+   实测手臂可达目标的收敛次数中位数 17、最大 31）。手臂够得到时，躯干**完全不动**；
+2. 手臂够不到时，从第一段的结果继续，放开全部 19 个自由度迭代，直到总次数达到 `max_iterations`。
+
+躯干很重，连续跟踪时这样可以让躯干尽量保持不动。设 `arms_first_iterations=0` 则从一开始就
+联合求解（更快，但小幅移动时躯干也会跟着动几度）。`torso_step_weight`（默认 0）可以在联合阶段
+额外惩罚躯干步长，但在手臂接近奇异时会明显拖慢收敛，一般不需要。
+
+实测（手臂在身前的初始位形）：仅手臂模式下，双手前移 0.55 m，或下移 0.5–0.7 m，都会失败；
+手臂 + 躯干模式能收敛（约 125–170 次迭代，2 ms 左右），躯干主要靠 `j19/j18` 下蹲前倾。
+100 组随机可达 19 维目标全部收敛。
+
+注意：
+
+- 不会自动回到直立：手臂优先只保证"能不动就不动"，躯干离开直立后不会被拉回；
+  需要时用 `posture_target`/`posture_weight`，或在 Qt 中拖动躯干滑条；
+- **没有重心/稳定性约束**：躯干前倾或下蹲时重心会前移，实机使用前需要另加重心约束，
+  并确认 URDF 中的质量（SolidWorks 估算值）；
+- 腿部 `j20/j19` 在直立时就处在下限 0，所以直立姿态本身在关节限位上；
+- 只检查手臂与躯干/底盘的碰撞，不检查手臂与腿部连杆的碰撞。
+
 ## 躯干避碰
 
-与 tron2-ik 的中心立柱避碰对应，这里检查手臂和躯干之间的碰撞：
+与 tron2-ik 的中心立柱避碰对应，这里检查手臂和机身之间的碰撞：
 
-- 障碍物：`body_Link`（网格包围盒，截到 z=0.45 m，不含颈部以上）和 `waist_Link` 的网格包围盒，
-  随锁定的躯干关节一起移动；
+- 障碍物：`body_Link`（网格包围盒，截到 z=0.45 m，不含颈部以上）、`waist_Link` 和
+  底盘 `base_link` 的网格包围盒；前两个随躯干关节一起移动。躯干参与 IK 时，
+  约束使用手臂采样点相对盒子的相对速度，躯干可以主动让开；
 - 采样：每条手臂肩→肘→腕心→法兰三段，每段 4 个采样点加法兰端点，按 `body_link_radius`
   （默认 0.06 m）膨胀成近似胶囊；
 - 在 QP 中作为线性化最小间距约束 `body_min_distance`（默认 0.01 m），激活距离
   `body_activation_distance`（默认 0.04 m）。
 
 零位时肩关节到躯干盒的固定间距为 0.0295 m，因此结果里的 `body_nearest_segment`
-在手臂远离躯干时通常显示肩部。目标落在躯干内部时，IK 会停在安全间距上并返回 `success=False`。
+在手臂远离躯干时通常显示肩部。目标落在障碍物内部时，IK 会停在安全间距上（容差 10 µm）
+并返回 `success=False`；躯干参与 IK 时，原本在直立躯干内部的目标可能因躯干让开而变得可达。
 用 `IKOptions(body_avoidance=False)` 或 `--no-body-avoidance` 关闭。
 
 ## 安装
@@ -91,6 +131,16 @@ model = FairinoQPModel(left_frame="left_flange", right_frame="right_flange")
 cd /home/xense/fairion/fairino_ik
 mamba env create -f environment.yml
 mamba activate fairinoik
+```
+
+or
+
+```bash
+cd /home/xense/fairion/fairino_ik
+mamba create -n fairino python=3.12
+mamba env update -n fairino -f environment.yml
+mamba deactivate
+mamba activate fairino
 ```
 
 `environment.yml` 已经以 editable 模式安装当前项目以及 Qt、MeshCat 和测试依赖。
@@ -124,12 +174,14 @@ fairino-ik-qt
 python examples/dual_arm_qt.py
 python examples/dual_arm_qt.py --no-meshcat
 python examples/dual_arm_qt.py --torso 0 0 0 0 0.3 --head 0.2
+python examples/dual_arm_qt.py --active-torso     # IK 同时求解躯干
 ```
 
 界面包含：
 
 - 左右臂各 7 个关节 FK 滑动条；
-- 躯干 5 轴 + 头部的锁定位置滑动条（改动后手臂关节不变、IK 目标同步到新的 FK 位姿）；
+- 躯干 5 轴 + 头部滑动条（改动后手臂关节不变、IK 目标同步到新的 FK 位姿）。
+  `--active-torso` 时躯干滑条就是 q 的一部分，会随 IK 结果更新；
 - 左右末端各自的 XYZ 和旋转目标滑动条。旋转滑条 `rot x/y/z` 是绕世界固定轴、
   相对上次 FK 同步姿态的旋转向量（度），没有万向锁；绝对 RPY 只做显示
   （在 pitch=±90°，即工具竖直时，RPY 本身是奇异的）；
@@ -139,7 +191,8 @@ python examples/dual_arm_qt.py --torso 0 0 0 0 0.3 --head 0.2
 - 原生 C++ QP solver 状态与躯干间距；
 - Reset、从当前 FK 写入 IK 目标以及动画显示。
 
-求单臂时，另一侧目标会保持当前 FK 位姿，因此仍由同一个 14 维双臂 QP 连续求解。
+求单臂时，另一侧目标会保持当前 FK 位姿，因此仍由同一个双臂 QP 连续求解；
+躯干参与时，躯干移动后另一只手会自动补偿以保持原位。
 
 ## 命令行示例
 
@@ -157,6 +210,19 @@ python examples/dual_arm_ik.py \
   --right-target 0.626 -0.2354 0.905 0.7854 0 -1.5708 \
   --q 0 30 0 60 0 30 0  0 30 0 60 0 30 0
 ```
+
+双手前下方的目标超出手臂可达范围，需要躯干下蹲。不加 `--active-torso` 时失败（误差 0.22 m），
+加上后收敛：
+
+```bash
+python examples/dual_arm_ik.py --active-torso \
+  --left-target 0.7507 0.2354 0.5038 0.2618 0 1.5708 \
+  --right-target 0.7507 -0.2354 0.5038 -0.2618 0 -1.5708 \
+  --q 0 45 0 90 0 45 0  0 45 0 90 0 45 0
+```
+
+`--active-torso` 时 `--torso` 是躯干初值；`--arms-first-iterations`、`--torso-step-weight`
+对应同名选项。
 
 查看全部参数：
 
@@ -184,8 +250,20 @@ result = model.solve_ik(left_target, right_target, q_seed, options)
 print(result.success, result.q, result.as_dict())
 ```
 
+手臂 + 躯干：
+
+```python
+model = FairinoQPModel(active_torso=True)
+q_seed = np.concatenate((np.radians([0, 45, 0, 90, 0, 45, 0] * 2), np.zeros(5)))
+left_target, right_target = model.end_effector_poses(q_seed)
+left_target[:3, 3] += [0.2, 0.0, -0.5]
+right_target[:3, 3] += [0.2, 0.0, -0.5]
+result = model.solve_ik(left_target, right_target, q_seed)
+left_q, right_q, torso_q = model.split_q(result.q)
+```
+
 独立目标可通过批量接口减少 Python/C++ 往返；左右目标形状为
-`(B, 4, 4)`，初值形状为 `(B, 14)`，返回按输入顺序排列的 `IKResult` 列表：
+`(B, 4, 4)`，初值形状为 `(B, nq)`，返回按输入顺序排列的 `IKResult` 列表：
 
 ```python
 results = model.solve_ik_batch(
@@ -211,8 +289,8 @@ pytest -q
 QT_QPA_PLATFORM=offscreen pytest -q tests/test_qt.py
 ```
 
-测试覆盖模型资源、关节分组、14/32 维映射、世界坐标系朝向、躯干锁定、法兰帧、双臂 FK→C++ QP IK、
-躯干避碰、批量接口以及 Qt 离屏构造。
+测试覆盖模型资源、关节分组、14/19/32 维映射、世界坐标系朝向、躯干锁定、法兰帧、双臂 FK→C++ QP IK、
+手臂优先的躯干 IK、躯干/底盘避碰、批量接口以及 Qt 离屏构造。
 
 ## 目录
 

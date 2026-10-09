@@ -20,6 +20,13 @@ namespace fairino_ik {
 namespace {
 
 constexpr double kFiniteLimit = 1e6;
+// The linearized barrier drives a blocked arm onto the clearance margin;
+// its curvature error (sub-micron, larger when the torso moves) is accepted.
+constexpr double kClearanceTolerance = 1e-5;
+// eiquadprog can overshoot an active bound by ~1e-5 rad when a joint sits on
+// its limit in the redundant 19-DoF problem.  Larger violations still reject
+// the step; smaller ones are projected back into the box.
+constexpr double kStepBoundTolerance = 1e-4;
 
 // Operational flange frames added below each wrist link.  The wrist mesh
 // (left/right_waist2_Link.STL) ends 0.114 m along the link's -x axis.
@@ -29,9 +36,10 @@ constexpr std::array<const char*, 2> kFlangeFrameNames{{
     "left_flange", "right_flange"}};
 const Eigen::Vector3d kFlangeOffset(-0.114, 0.0, 0.0);
 
-// Torso collision boxes, expressed in their own link frames.  They are the
+// Collision boxes, expressed in their own link frames.  They are the
 // bounding boxes of the URDF meshes; body_Link is cut at z = 0.45 m so the
-// neck and head mount do not block the space above the shoulders.
+// neck and head mount do not block the space above the shoulders.  The
+// base_link box is the chassis, which the hands reach when the torso squats.
 struct BodyBox {
   const char* frame;
   Eigen::Vector3d center;
@@ -42,6 +50,8 @@ const std::array<BodyBox, kBodyBoxCount> kBodyBoxes{{
      Eigen::Vector3d(0.16, 0.1687, 0.225)},
     {"waist_Link", Eigen::Vector3d(0.0, 0.03005, -0.1291),
      Eigen::Vector3d(0.118, 0.10995, 0.1859)},
+    {"base_link", Eigen::Vector3d(0.0, -0.14933, 0.02025),
+     Eigen::Vector3d(0.30165, 0.38233, 0.19125)},
 }};
 
 // Shoulder, elbow, wrist center and flange.  Coincident URDF frames
@@ -100,6 +110,12 @@ BoxDistance signedDistanceToBox(
   return {-penetration, box_pose.linear() * normal};
 }
 
+Eigen::Matrix3d skew(const Eigen::Vector3d& v) {
+  Eigen::Matrix3d result;
+  result << 0.0, -v.z(), v.y(), v.z(), 0.0, -v.x(), -v.y(), v.x(), 0.0;
+  return result;
+}
+
 bool finite(double value) {
   return std::isfinite(value);
 }
@@ -118,7 +134,9 @@ Eigen::Vector3d rotationError(
 Model::Model(
     const std::string& urdf_path,
     const std::string& left_frame,
-    const std::string& right_frame) {
+    const std::string& right_frame,
+    bool active_torso)
+    : active_torso_(active_torso), nq_(active_torso ? kMaxDof : kArmDof) {
   if (urdf_path.empty()) {
     throw std::invalid_argument("Fairino IK URDF path cannot be empty");
   }
@@ -133,19 +151,13 @@ Model::Model(
   full_data_ = pinocchio::Data(full_model_);
   left_frame_name_ = left_frame;
   right_frame_name_ = right_frame;
-  for (int i = 0; i < kArmDof; ++i) {
-    const auto id = full_model_.getJointId(arm_joint_names_[i]);
+  for (int i = 0; i < kMaxDof; ++i) {
+    const auto id = full_model_.getJointId(joint_names_[i]);
     if (id == 0 || id >= static_cast<pinocchio::JointIndex>(full_model_.njoints) ||
         full_model_.joints[id].nq() != 1 || full_model_.joints[id].nv() != 1) {
-      throw std::invalid_argument("Missing 1-DoF arm joint " + arm_joint_names_[i]);
+      throw std::invalid_argument("Missing 1-DoF joint " + joint_names_[i]);
     }
     full_q_indices_[i] = full_model_.joints[id].idx_q();
-  }
-  for (const auto& name : torso_joint_names_) {
-    if (!full_model_.existJointName(name) ||
-        full_model_.joints[full_model_.getJointId(name)].nq() != 1) {
-      throw std::invalid_argument("Missing 1-DoF torso joint " + name);
-    }
   }
   if (!full_model_.existJointName(head_joint_name_) ||
       full_model_.joints[full_model_.getJointId(head_joint_name_)].nq() != 1) {
@@ -195,8 +207,9 @@ Model::Model(
 }
 
 Model::Model(const std::string& urdf_path, const std::string& left_frame,
-             const std::string& right_frame, const std::array<double, 16>& base_pose)
-    : Model(urdf_path, left_frame, right_frame) {
+             const std::string& right_frame, const std::array<double, 16>& base_pose,
+             bool active_torso)
+    : Model(urdf_path, left_frame, right_frame, active_torso) {
   base_pose_ = poseFromArray(base_pose);
 }
 
@@ -217,11 +230,9 @@ void Model::addFlangeFrames() {
 }
 
 void Model::configureReducedModel(const Options& options) {
-  std::array<double, kTorsoDof + 1> coordinates{};
-  std::copy(options.torso_position.begin(), options.torso_position.end(),
-            coordinates.begin());
-  coordinates.back() = options.head_position;
-  if (reduced_initialized_ && coordinates == fixed_coordinates_) return;
+  // Arms and torso always stay in the reduced model, so only the locked
+  // head yaw (and the irrelevant wheels) require a rebuild.
+  if (reduced_initialized_ && options.head_position == fixed_head_position_) return;
 
   std::vector<pinocchio::JointIndex> locked;
   locked.reserve(full_model_.njoints);
@@ -230,46 +241,46 @@ void Model::configureReducedModel(const Options& options) {
        ++joint_id) {
     const std::string& name = full_model_.names[joint_id];
     const bool active = std::find(
-                            arm_joint_names_.begin(), arm_joint_names_.end(),
-                            name) != arm_joint_names_.end();
+                            joint_names_.begin(), joint_names_.end(),
+                            name) != joint_names_.end();
     if (!active && full_model_.joints[joint_id].nv() > 0) {
       locked.push_back(joint_id);
     }
   }
 
-  const Eigen::VectorXd reference = fullConfigurationImpl(std::vector<double>(kArmDof, 0.0), options);
+  const Eigen::VectorXd reference = fullConfigurationImpl(std::vector<double>(nq_, 0.0), options);
   reduced_model_ =
       pinocchio::buildReducedModel(full_model_, locked, reference);
   reduced_data_ = pinocchio::Data(reduced_model_);
-  if (reduced_model_.nq != kArmDof || reduced_model_.nv != kArmDof) {
+  if (reduced_model_.nq != kMaxDof || reduced_model_.nv != kMaxDof) {
     throw std::runtime_error(
-        "Fairino C++ IK reduced model must have 14 DoF, got nq=" +
+        "Fairino C++ IK reduced model must have 19 DoF, got nq=" +
         std::to_string(reduced_model_.nq) + ", nv=" +
         std::to_string(reduced_model_.nv));
   }
 
-  for (int i = 0; i < kArmDof; ++i) {
+  for (int i = 0; i < kMaxDof; ++i) {
     const pinocchio::JointIndex joint_id =
-        reduced_model_.getJointId(arm_joint_names_[i]);
+        reduced_model_.getJointId(joint_names_[i]);
     if (joint_id == 0 ||
-        reduced_model_.names[joint_id] != arm_joint_names_[i]) {
+        reduced_model_.names[joint_id] != joint_names_[i]) {
       throw std::runtime_error(
-          "Reduced Fairino IK model is missing joint " + arm_joint_names_[i]);
+          "Reduced Fairino IK model is missing joint " + joint_names_[i]);
     }
     const int index = reduced_model_.joints[joint_id].idx_q();
-    arm_q_indices_[i] = index;
+    reduced_q_indices_[i] = index;
     double lower = reduced_model_.lowerPositionLimit[index];
     double upper = reduced_model_.upperPositionLimit[index];
     if (!finite(lower)) lower = -kFiniteLimit;
     if (!finite(upper)) upper = kFiniteLimit;
     if (lower > upper) {
       throw std::runtime_error(
-          "Invalid limits for Fairino IK joint " + arm_joint_names_[i]);
+          "Invalid limits for Fairino IK joint " + joint_names_[i]);
     }
     lower_limits_[i] = lower;
     upper_limits_[i] = upper;
     const int velocity_index = reduced_model_.joints[joint_id].idx_v();
-    if (velocity_index != index) throw std::runtime_error("Arm q/v ordering mismatch");
+    if (velocity_index != index) throw std::runtime_error("Reduced q/v ordering mismatch");
     const double speed = reduced_model_.velocityLimit[velocity_index];
     urdf_velocity_limits_[i] = finite(speed) && speed > 0.0 ? speed : 0.0;
   }
@@ -306,24 +317,29 @@ void Model::configureReducedModel(const Options& options) {
     }
     body_box_frame_ids_[box] = reduced_model_.getFrameId(kBodyBoxes[box].frame);
   }
-  fixed_coordinates_ = coordinates;
+  fixed_head_position_ = options.head_position;
   reduced_initialized_ = true;
+}
+
+double Model::torsoValue(const std::vector<double>& q, const Options& options,
+                         int index) const {
+  return active_torso_ ? q[kArmDof + index] : options.torso_position[index];
 }
 
 Eigen::VectorXd Model::fullConfigurationImpl(const std::vector<double>& q,
                                              const Options& options) const {
   validateQ(q, "q");
   Eigen::VectorXd result = pinocchio::neutral(full_model_);
-  for (int i = 0; i < kArmDof; ++i) result[full_q_indices_[i]] = q[i];
-  const auto set_locked = [&](const std::string& name, double value) {
-    if (!finite(value)) throw std::invalid_argument("Fixed joint values must be finite");
-    const int index = full_model_.joints[full_model_.getJointId(name)].idx_q();
+  const auto set_clamped = [&](int index, double value) {
+    if (!finite(value)) throw std::invalid_argument("Joint values must be finite");
     result[index] = std::clamp(value, full_model_.lowerPositionLimit[index],
                                full_model_.upperPositionLimit[index]);
   };
+  for (int i = 0; i < kArmDof; ++i) result[full_q_indices_[i]] = q[i];
   for (int i = 0; i < kTorsoDof; ++i)
-    set_locked(torso_joint_names_[i], options.torso_position[i]);
-  set_locked(head_joint_name_, options.head_position);
+    set_clamped(full_q_indices_[kArmDof + i], torsoValue(q, options, i));
+  set_clamped(full_model_.joints[full_model_.getJointId(head_joint_name_)].idx_q(),
+              options.head_position);
   for (const auto& relation : mimic_)
     result[relation.child] = relation.multiplier * result[relation.parent] + relation.offset;
   return result;
@@ -335,20 +351,21 @@ std::vector<double> Model::fullConfiguration(const std::vector<double>& q, const
   return {full.data(), full.data() + full.size()};
 }
 
+std::vector<std::string> Model::jointNames() const {
+  return {joint_names_.begin(), joint_names_.begin() + nq_};
+}
+
 std::vector<std::array<double, 2>> Model::jointLimits() const {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<std::array<double, 2>> result;
-  for (int i = 0; i < kArmDof; ++i) result.push_back({lower_limits_[i], upper_limits_[i]});
+  for (int i = 0; i < nq_; ++i) result.push_back({lower_limits_[i], upper_limits_[i]});
   return result;
 }
 
 std::vector<std::array<double, 2>> Model::torsoLimits() const {
+  std::lock_guard<std::mutex> lock(mutex_);
   std::vector<std::array<double, 2>> result;
-  for (const auto& name : torso_joint_names_) {
-    const int index = full_model_.joints[full_model_.getJointId(name)].idx_q();
-    result.push_back({full_model_.lowerPositionLimit[index],
-                      full_model_.upperPositionLimit[index]});
-  }
+  for (int i = kArmDof; i < kMaxDof; ++i) result.push_back({lower_limits_[i], upper_limits_[i]});
   return result;
 }
 
@@ -361,14 +378,16 @@ std::array<double, 2> Model::headLimits() const {
 
 double Model::velocityLimit(int index, const Options& options) const {
   const double urdf = urdf_velocity_limits_[index];
-  return urdf > 0.0 ? urdf : options.default_velocity_limit;
+  if (urdf > 0.0) return urdf;
+  return index < kArmDof ? options.default_velocity_limit
+                         : options.torso_velocity_limit;
 }
 
 std::vector<double> Model::velocityLimits(const Options& options) const {
   std::lock_guard<std::mutex> lock(mutex_);
   validateOptions(options);
-  std::vector<double> result(kArmDof);
-  for (int i = 0; i < kArmDof; ++i) result[i] = velocityLimit(i, options);
+  std::vector<double> result(nq_);
+  for (int i = 0; i < nq_; ++i) result[i] = velocityLimit(i, options);
   return result;
 }
 
@@ -400,10 +419,10 @@ std::map<std::string, std::array<double, 16>> Model::framePlacements(
 
 void Model::validateQ(
     const std::vector<double>& q, const char* name) const {
-  if (q.size() != kArmDof) {
+  if (static_cast<int>(q.size()) != nq_) {
     throw std::invalid_argument(
-        std::string(name) + " must contain 14 values, got " +
-        std::to_string(q.size()));
+        std::string(name) + " must contain " + std::to_string(nq_) +
+        " values, got " + std::to_string(q.size()));
   }
   for (double value : q) {
     if (!finite(value)) {
@@ -417,7 +436,8 @@ void Model::validateOptions(const Options& options) const {
     throw std::invalid_argument("max_iterations must be >= 1");
   }
   if (options.qp_max_iterations < 1) throw std::invalid_argument("qp_max_iterations must be >= 1");
-  const std::array<double, 17> values = {
+  if (options.arms_first_iterations < 0) throw std::invalid_argument("arms_first_iterations must be >= 0");
+  const std::array<double, 19> values = {
       options.dt,
       options.damping,
       options.step_size,
@@ -430,6 +450,8 @@ void Model::validateOptions(const Options& options) const {
       options.frame_gain,
       options.posture_weight,
       options.default_velocity_limit,
+      options.torso_velocity_limit,
+      options.torso_step_weight,
       options.body_activation_distance,
       options.body_min_distance,
       options.body_link_radius,
@@ -445,6 +467,7 @@ void Model::validateOptions(const Options& options) const {
   if (options.dt <= 0.0 ||
       options.step_size <= 0.0 || options.max_step_norm <= 0.0 ||
       options.tolerance <= 0.0 || options.default_velocity_limit <= 0.0 ||
+      options.torso_velocity_limit <= 0.0 ||
       (options.position_cost == 0.0 && options.orientation_cost == 0.0) ||
       options.posture_gain < 0.0 || !finite(options.posture_gain)) {
     throw std::invalid_argument(
@@ -475,26 +498,27 @@ void Model::validateOptions(const Options& options) const {
   }
 }
 
-Eigen::VectorXd Model::armToReduced(
-    const std::vector<double>& q_arm) const {
-  validateQ(q_arm, "q");
+Eigen::VectorXd Model::toReduced(
+    const std::vector<double>& q, const Options& options) const {
+  validateQ(q, "q");
   Eigen::VectorXd result = pinocchio::neutral(reduced_model_);
-  for (int i = 0; i < kArmDof; ++i) {
-    result[arm_q_indices_[i]] =
-        std::clamp(q_arm[i], lower_limits_[i], upper_limits_[i]);
+  for (int i = 0; i < kMaxDof; ++i) {
+    const double value = i < kArmDof ? q[i] : torsoValue(q, options, i - kArmDof);
+    result[reduced_q_indices_[i]] =
+        std::clamp(value, lower_limits_[i], upper_limits_[i]);
   }
   return result;
 }
 
-std::vector<double> Model::reducedToArm(
+std::vector<double> Model::reducedToPublic(
     const Eigen::VectorXd& q_reduced) const {
-  if (q_reduced.size() != kArmDof) {
-    throw std::invalid_argument("reduced q must contain 14 values");
+  if (q_reduced.size() != kMaxDof) {
+    throw std::invalid_argument("reduced q must contain 19 values");
   }
-  std::vector<double> result(kArmDof);
-  for (int i = 0; i < kArmDof; ++i) {
+  std::vector<double> result(nq_);
+  for (int i = 0; i < nq_; ++i) {
     result[i] = std::clamp(
-        q_reduced[arm_q_indices_[i]], lower_limits_[i], upper_limits_[i]);
+        q_reduced[reduced_q_indices_[i]], lower_limits_[i], upper_limits_[i]);
   }
   return result;
 }
@@ -547,11 +571,11 @@ Eigen::Isometry3d Model::framePose(
 }
 
 std::vector<double> Model::forwardKinematics(
-    const std::vector<double>& q_arm, const std::string& side, const Options& options) {
+    const std::vector<double>& q_public, const std::string& side, const Options& options) {
   std::lock_guard<std::mutex> lock(mutex_);
   validateOptions(options);
   configureReducedModel(options);
-  const Eigen::VectorXd q = armToReduced(q_arm);
+  const Eigen::VectorXd q = toReduced(q_public, options);
   const pinocchio::FrameIndex frame =
       (side == "left" || side == "l")
           ? left_frame_id_
@@ -601,39 +625,50 @@ Model::PoseErrors Model::evaluate(
 
 Model::BodyMetrics Model::evaluateBodyAvoidance(
     const Options& options,
-    Eigen::Matrix<double, kArmDof, kArmDof>* hessian,
-    Eigen::Matrix<double, kArmDof, 1>* rhs,
-    Eigen::Matrix<double, kBodySamples, kArmDof>* constraints,
-    Eigen::Matrix<double, kBodySamples, 1>* offsets) {
+    bool torso_free,
+    FullMatrix* hessian,
+    FullVector* rhs,
+    ConstraintMatrix* constraints,
+    ConstraintVector* offsets) {
   BodyMetrics metrics;
   if (constraints) constraints->setZero();
   if (offsets) offsets->setOnes();
   if (!options.body_avoidance) return metrics;
 
   const bool add_task = hessian != nullptr && rhs != nullptr;
-  // Torso joints are locked, so the boxes are constant during a solve; the
-  // reduced model still carries their frames.  Everything here is in the
-  // model root frame, as are the Jacobians.
+  // Everything here is in the model root frame, as are the Jacobians.  The
+  // body and waist boxes ride on the torso joints, so a clearance changes
+  // with the relative velocity between an arm point and the box.
   std::array<Eigen::Isometry3d, kBodyBoxCount> box_poses;
+  std::array<Eigen::Vector3d, kBodyBoxCount> box_origins;
+  std::array<Eigen::Matrix<double, 6, kMaxDof>, kBodyBoxCount> box_jacobians;
   std::array<Eigen::Vector3d, kBodyBoxCount> inflated_half_extents;
   for (std::size_t box = 0; box < kBodyBoxes.size(); ++box) {
+    const auto frame_id = body_box_frame_ids_[box];
     const Eigen::Isometry3d frame(
-        reduced_data_.oMf[body_box_frame_ids_[box]].toHomogeneousMatrix());
+        reduced_data_.oMf[frame_id].toHomogeneousMatrix());
     box_poses[box] = frame * Eigen::Translation3d(kBodyBoxes[box].center);
+    box_origins[box] = frame.translation();
     inflated_half_extents[box] = kBodyBoxes[box].half_extents +
         Eigen::Vector3d::Constant(options.body_link_radius);
+    if (add_task) {
+      box_jacobians[box].setZero();
+      pinocchio::getFrameJacobian(
+          reduced_model_, reduced_data_, frame_id,
+          pinocchio::LOCAL_WORLD_ALIGNED, box_jacobians[box]);
+    }
   }
   int sample = 0;
 
   for (std::size_t side = 0; side < body_arm_frame_ids_.size(); ++side) {
     std::array<Eigen::Vector3d, 4> positions;
-    std::array<Eigen::Matrix<double, 3, kArmDof>, 4> linear_jacobians;
+    std::array<Eigen::Matrix<double, 3, kMaxDof>, 4> linear_jacobians;
     for (std::size_t index = 0;
          index < body_arm_frame_ids_[side].size(); ++index) {
       const auto frame_id = body_arm_frame_ids_[side][index];
       positions[index] = reduced_data_.oMf[frame_id].translation();
       if (add_task) {
-        Eigen::Matrix<double, 6, kArmDof> frame_jacobian;
+        Eigen::Matrix<double, 6, kMaxDof> frame_jacobian;
         frame_jacobian.setZero();
         pinocchio::getFrameJacobian(
             reduced_model_, reduced_data_, frame_id,
@@ -644,7 +679,7 @@ Model::BodyMetrics Model::evaluateBodyAvoidance(
 
     const auto process_sample = [&](
         const Eigen::Vector3d& point,
-        const Eigen::Matrix<double, 3, kArmDof>* point_jacobian,
+        const Eigen::Matrix<double, 3, kMaxDof>* point_jacobian,
         const std::array<std::string, kBodyBoxCount>& labels) {
       for (std::size_t box_index = 0; box_index < kBodyBoxes.size(); ++box_index) {
         const int row = sample++;
@@ -659,10 +694,23 @@ Model::BodyMetrics Model::evaluateBodyAvoidance(
           continue;
         }
 
-        const Eigen::Matrix<double, 1, kArmDof> distance_jacobian =
-            box.outward_normal.transpose() * (*point_jacobian);
-        // The shoulder sample is fixed to the torso.  A zero row cannot
-        // change the clearance and would only make the QP infeasible.
+        // Velocity of the box-fixed point that coincides with the sample:
+        // v_o + w x (p - o).
+        const auto& box_jacobian = box_jacobians[box_index];
+        const Eigen::Matrix<double, 3, kMaxDof> box_point_jacobian =
+            box_jacobian.topRows<3>() -
+            skew(point - box_origins[box_index]) * box_jacobian.bottomRows<3>();
+        Eigen::Matrix<double, 1, kMaxDof> distance_jacobian =
+            box.outward_normal.transpose() *
+            (*point_jacobian - box_point_jacobian);
+        // A fixed torso cannot help to keep the clearance.
+        if (!torso_free) {
+          for (int i = kArmDof; i < kMaxDof; ++i)
+            distance_jacobian[reduced_q_indices_[i]] = 0.0;
+        }
+        // A sample rigidly attached to the box (the shoulder vs body_Link,
+        // or anything vs base_link with a locked torso) cannot change its
+        // clearance; a zero row would only make the QP infeasible.
         if (distance_jacobian.squaredNorm() < 1e-12) continue;
         if (constraints && offsets) {
           constraints->row(row) = distance_jacobian;
@@ -690,7 +738,7 @@ Model::BodyMetrics Model::evaluateBodyAvoidance(
             (1.0 - alpha) * positions[segment] +
             alpha * positions[segment + 1];
         if (add_task) {
-          const Eigen::Matrix<double, 3, kArmDof> point_jacobian =
+          const Eigen::Matrix<double, 3, kMaxDof> point_jacobian =
               (1.0 - alpha) * linear_jacobians[segment] +
               alpha * linear_jacobians[segment + 1];
           process_sample(point, &point_jacobian, label);
@@ -713,6 +761,32 @@ Model::BodyMetrics Model::evaluateBodyAvoidance(
     }
   }
   return metrics;
+}
+
+template <int N>
+eiquadprog::solvers::RtEiquadprog_status Model::solveActiveQP(
+    BoxQP<N, kBodySamples>& qp, const FullMatrix& hessian,
+    const FullVector& gradient, const FullVector& lower,
+    const FullVector& upper, const ConstraintMatrix& constraints,
+    const ConstraintVector& offsets, int max_iterations, FullVector& step,
+    int* iterations, int* active_constraints) {
+  typename BoxQP<N, kBodySamples>::Matrix h;
+  typename BoxQP<N, kBodySamples>::Vector g, lo, hi, x;
+  Eigen::Matrix<double, kBodySamples, N> c;
+  for (int i = 0; i < N; ++i) {
+    const int ri = reduced_q_indices_[i];
+    g[i] = gradient[ri];
+    lo[i] = lower[ri];
+    hi[i] = upper[ri];
+    c.col(i) = constraints.col(ri);
+    for (int j = 0; j < N; ++j) h(i, j) = hessian(ri, reduced_q_indices_[j]);
+  }
+  const auto status = qp.solve(h, g, lo, hi, max_iterations, x, c, offsets);
+  *iterations = qp.iterations();
+  *active_constraints = qp.activeConstraints();
+  step.setZero();
+  for (int i = 0; i < N; ++i) step[reduced_q_indices_[i]] = x[i];
+  return status;
 }
 
 Result Model::solveIK(
@@ -764,10 +838,10 @@ Result Model::solveIKUnlocked(
       poseFromArray(left_values);
   const Eigen::Isometry3d right_target =
       poseFromArray(right_values);
-  Eigen::VectorXd q = armToReduced(q_seed);
+  Eigen::VectorXd q = toReduced(q_seed, options);
   Eigen::VectorXd posture = q;
   if (!options.posture_target.empty()) {
-    posture = armToReduced(options.posture_target);
+    posture = toReduced(options.posture_target, options);
   }
   const double position_tolerance =
       options.position_tolerance > 0.0 ? options.position_tolerance
@@ -778,35 +852,37 @@ Result Model::solveIKUnlocked(
 
   Result result;
   PoseErrors errors = evaluate(q, left_target, right_target);
-  BodyMetrics body = evaluateBodyAvoidance(options, nullptr, nullptr);
+  BodyMetrics body = evaluateBodyAvoidance(options, false, nullptr, nullptr);
   auto converged = [&]() {
     return errors.left_position <= position_tolerance &&
            errors.right_position <= position_tolerance &&
            errors.left_orientation <= orientation_tolerance &&
            errors.right_orientation <= orientation_tolerance &&
            (!options.body_avoidance ||
-            body.min_distance >= options.body_min_distance);
+            body.min_distance >= options.body_min_distance - kClearanceTolerance);
   };
-  if (converged()) {
-    result.success = true;
-    result.status = "converged";
-  } else {
-    result.status = "max_iterations";
-    Eigen::Matrix<double, 12, kArmDof> jacobian;
-    Eigen::Matrix<double, 12, 12> weight =
-        Eigen::Matrix<double, 12, 12>::Zero();
-    for (int block = 0; block < 2; ++block) {
-      weight.block<3, 3>(block * 6, block * 6).diagonal().setConstant(
-          options.position_cost);
-      weight.block<3, 3>(block * 6 + 3, block * 6 + 3).diagonal().setConstant(
-          options.orientation_cost);
-    }
+  Eigen::Matrix<double, 12, 12> weight =
+      Eigen::Matrix<double, 12, 12>::Zero();
+  for (int block = 0; block < 2; ++block) {
+    weight.block<3, 3>(block * 6, block * 6).diagonal().setConstant(
+        options.position_cost);
+    weight.block<3, 3>(block * 6 + 3, block * 6 + 3).diagonal().setConstant(
+        options.orientation_cost);
+  }
 
-    for (int iteration = 1; iteration <= options.max_iterations; ++iteration) {
+  // Runs up to `budget` QP iterations over the arms, or over arms and torso
+  // when `torso_free`.  Returns false after a rejected QP step.
+  const auto run_phase = [&](bool torso_free, int budget) {
+    const int active = torso_free ? kMaxDof : kArmDof;
+    // The trust box is per active coordinate, so ||step|| <= max_step_norm.
+    const double trust = options.max_step_norm / std::sqrt(double(active));
+    Eigen::Matrix<double, 12, kMaxDof> jacobian;
+    for (int count = 0; count < budget; ++count) {
+      const int iteration = ++result.iterations;
       // evaluate() has already updated placements and Jacobians at this q,
       // initially and after every applied QP step. Reuse that state here.
-      Eigen::Matrix<double, 6, kArmDof> left_jacobian;
-      Eigen::Matrix<double, 6, kArmDof> right_jacobian;
+      Eigen::Matrix<double, 6, kMaxDof> left_jacobian;
+      Eigen::Matrix<double, 6, kMaxDof> right_jacobian;
       // getFrameJacobian only writes the columns that belong to the frame's
       // kinematic subtree.  Initialize the fixed-size buffers explicitly so
       // the other arm's columns are deterministic zeros.
@@ -836,65 +912,103 @@ Result Model::solveIKUnlocked(
           base_rotation * right_jacobian.topRows<3>();
       right_jacobian.bottomRows<3>() =
           base_rotation * right_jacobian.bottomRows<3>();
-      jacobian.block<6, kArmDof>(0, 0) = left_jacobian;
-      jacobian.block<6, kArmDof>(6, 0) = right_jacobian;
+      jacobian.block<6, kMaxDof>(0, 0) = left_jacobian;
+      jacobian.block<6, kMaxDof>(6, 0) = right_jacobian;
 
-      Eigen::Matrix<double, kArmDof, kArmDof> hessian =
-          jacobian.transpose() * weight * jacobian;
+      // Everything below is assembled over all 19 reduced coordinates;
+      // solveActiveQP drops the torso columns when the torso is fixed.
+      FullMatrix hessian = jacobian.transpose() * weight * jacobian;
       // Strict convexity is required by the active-set solver, even when the
       // caller requests zero damping or the arm is stretched (singular).
       hessian.diagonal().array() += std::max(1e-10, options.damping * options.damping);
-      Eigen::Matrix<double, kArmDof, 1> rhs =
+      FullVector rhs =
           jacobian.transpose() * weight *
           (options.frame_gain * errors.task_error);
       if (options.posture_weight > 0.0) {
         hessian.diagonal().array() += options.posture_weight;
         rhs += options.posture_weight * options.posture_gain * (posture - q);
       }
-      Eigen::Matrix<double, kBodySamples, kArmDof> body_constraints;
-      Eigen::Matrix<double, kBodySamples, 1> body_offsets;
-      body = evaluateBodyAvoidance(options, &hessian, &rhs, &body_constraints, &body_offsets);
-      Eigen::Matrix<double, kArmDof, 1> lower, upper, step;
+      for (int i = kArmDof; i < kMaxDof; ++i)
+        hessian(reduced_q_indices_[i], reduced_q_indices_[i]) += options.torso_step_weight;
+      ConstraintMatrix body_constraints;
+      ConstraintVector body_offsets;
+      body = evaluateBodyAvoidance(options, torso_free, &hessian, &rhs,
+                                   &body_constraints, &body_offsets);
+      FullVector lower = FullVector::Zero(), upper = FullVector::Zero(), step;
       // Optimize configuration increments, not a post-clipped velocity.
-      // The conservative trust box guarantees ||step|| <= max_step_norm.
-      const double trust = options.max_step_norm / std::sqrt(double(kArmDof));
-      for (int i = 0; i < kArmDof; ++i) {
-        const int index = arm_q_indices_[i];
+      for (int i = 0; i < active; ++i) {
+        const int index = reduced_q_indices_[i];
         const double limit = std::min(
             trust, velocityLimit(i, options) * options.dt * options.step_size);
         lower[index] = std::max(lower_limits_[i] - q[index], -limit);
         upper[index] = std::min(upper_limits_[i] - q[index], limit);
       }
-      const auto qp_status = qp_.solve(hessian, -options.step_size * rhs, lower, upper,
-                                       options.qp_max_iterations, step, body_constraints, body_offsets);
-      result.qp_iterations += qp_.iterations();
-      result.qp_active_constraints = std::max(result.qp_active_constraints, qp_.activeConstraints());
+      int qp_iterations = 0;
+      int qp_active = 0;
+      const FullVector gradient = -options.step_size * rhs;
+      const auto qp_status = torso_free
+          ? solveActiveQP<kMaxDof>(torso_qp_, hessian, gradient, lower, upper,
+                                   body_constraints, body_offsets,
+                                   options.qp_max_iterations, step,
+                                   &qp_iterations, &qp_active)
+          : solveActiveQP<kArmDof>(arm_qp_, hessian, gradient, lower, upper,
+                                   body_constraints, body_offsets,
+                                   options.qp_max_iterations, step,
+                                   &qp_iterations, &qp_active);
+      result.qp_iterations += qp_iterations;
+      result.qp_active_constraints = std::max(result.qp_active_constraints, qp_active);
       if (qp_status != eiquadprog::solvers::RT_EIQUADPROG_OPTIMAL || !step.allFinite() ||
-          (step.array() < lower.array() - 1e-8).any() || (step.array() > upper.array() + 1e-8).any()) {
+          (step.array() < lower.array() - kStepBoundTolerance).any() ||
+          (step.array() > upper.array() + kStepBoundTolerance).any()) {
         result.status = qp_status == eiquadprog::solvers::RT_EIQUADPROG_MAX_ITER_REACHED
             ? "qp_max_iterations" : "qp_solver_error";
+        const double violation = std::max(
+            (lower - step).maxCoeff(), (step - upper).maxCoeff());
         result.message = "C++ eiquadprog failed; no unverified QP step was applied (status=" +
-                         std::to_string(int(qp_status)) + ")";
-        result.iterations = iteration;
-        break;
+                         std::to_string(int(qp_status)) + ", bound violation=" +
+                         std::to_string(violation) + ", iteration=" +
+                         std::to_string(iteration) + ")";
+        return false;
       }
+      // Remove the solver's rounding at an active joint limit.
+      step = step.cwiseMax(lower).cwiseMin(upper);
       q += step;
-      for (int i = 0; i < kArmDof; ++i) {
-        q[arm_q_indices_[i]] =
-            std::clamp(q[arm_q_indices_[i]], lower_limits_[i], upper_limits_[i]);
+      for (int i = 0; i < active; ++i) {
+        q[reduced_q_indices_[i]] =
+            std::clamp(q[reduced_q_indices_[i]], lower_limits_[i], upper_limits_[i]);
       }
       errors = evaluate(q, left_target, right_target);
-      body = evaluateBodyAvoidance(options, nullptr, nullptr);
-      result.iterations = iteration;
+      body = evaluateBodyAvoidance(options, torso_free, nullptr, nullptr);
       if (converged()) {
         result.success = true;
         result.status = "converged";
-        break;
+        return true;
+      }
+    }
+    return true;
+  };
+
+  if (converged()) {
+    result.success = true;
+    result.status = "converged";
+  } else {
+    result.status = "max_iterations";
+    if (!active_torso_) {
+      run_phase(false, options.max_iterations);
+    } else {
+      // Arms first: the heavy torso only moves when the arms cannot reach
+      // the targets from the current torso pose within a short budget.
+      const int arm_budget = std::min(options.arms_first_iterations, options.max_iterations);
+      if (arm_budget > 0) run_phase(false, arm_budget);
+      if (!result.success && result.iterations < options.max_iterations) {
+        result.status = "max_iterations";
+        result.message.clear();
+        run_phase(true, options.max_iterations - result.iterations);
       }
     }
   }
 
-  result.q = reducedToArm(q);
+  result.q = reducedToPublic(q);
   // Keep the public full configuration in a plain vector without another
   // Python/native round trip.  fullConfigurationImpl is already under the
   // model mutex.
@@ -909,12 +1023,12 @@ Result Model::solveIKUnlocked(
   result.body_nearest_segment = body.nearest_segment;
   result.body_collision_free =
       !options.body_avoidance ||
-      body.min_distance >= options.body_min_distance;
+      body.min_distance >= options.body_min_distance - kClearanceTolerance;
   if (!result.body_collision_free) {
     result.success = false;
     result.status = "body_collision";
     std::ostringstream message;
-    message << "C++ dual-arm IK rejected by torso boxes: clearance="
+    message << "C++ dual-arm IK rejected by body boxes: clearance="
             << body.min_distance << " m, required>="
             << options.body_min_distance << " m";
     if (!body.nearest_segment.empty()) {

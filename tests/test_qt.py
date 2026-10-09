@@ -98,3 +98,34 @@ def test_rotation_sliders_have_no_gimbal_lock() -> None:
         panel.controls[name].set_value(0.0)
     assert np.linalg.matrix_rank(np.array(axes)) == 3
     app.processEvents()
+
+
+def test_qt_active_torso_solves_beyond_arm_reach() -> None:
+    qt = _load_qt()
+    app = QApplication.instance() or QApplication([])
+    model = FairinoQPModel(active_torso=True)
+    initial = np.concatenate((np.radians([0, 45, 0, 90, 0, 45, 0] * 2), np.zeros(5)))
+    window = FairinoIKWindow.create(
+        qt, model, IKOptions(), initial_q=initial, visualizer=None, smooth_time=0.0,
+    )
+    window.show()
+    app.processEvents()
+    assert window.goal_q.shape == (19,)
+
+    for panel in (window.left_pose, window.right_pose):
+        target = panel.pose()
+        target[:3, 3] += [0.2, 0.0, -0.5]
+        panel.set_pose(target)
+    window._solve("both")
+    app.processEvents()
+    assert "success=True" in window.ik_status.text(), window.ik_status.text()
+    assert np.abs(window.goal_q[14:]).max() > np.radians(5.0)
+    # The torso sliders follow the IK solution.
+    assert np.allclose(window.torso_joints.q()[:5], window.goal_q[14:], atol=2e-4)
+
+    # Dragging a torso slider moves the torso inside q, not the locked options.
+    window.torso_joints.controls[4].set_value(15.0)
+    window._apply_torso_from_sliders()
+    assert np.isclose(window.goal_q[18], np.deg2rad(15.0), atol=2e-4)
+    assert window.options.torso_position == (0.0,) * 5
+    window.close()

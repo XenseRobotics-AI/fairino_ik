@@ -65,14 +65,16 @@ class IKOptions:
     default x forward, y left, z up, with the origin at ``base_link``
     (see ``DEFAULT_BASE_POSE``).
     Position tolerances and costs use metres; orientation tolerances and costs
-    use radians.  ``posture_target`` follows the public arm order: left seven,
-    right seven.  When posture regularization is enabled without an explicit
-    target, the seed becomes the target so successive solves favour continuous
-    solutions.
+    use radians.  ``posture_target`` follows the model's public order (left
+    seven, right seven, then the torso when it is active).  When posture
+    regularization is enabled without an explicit target, the seed becomes the
+    target so successive solves favour continuous solutions.
 
-    ``torso_position`` (``TORSO_JOINTS`` order) and ``head_position`` are
-    locked during IK but change where the arms are mounted, so FK, IK and the
-    full configuration all use them.
+    In arm-only mode ``torso_position`` (``TORSO_JOINTS`` order) locks the
+    torso; it changes where the arms are mounted, so FK, IK and the full
+    configuration all use it.  With ``FairinoQPModel(active_torso=True)`` the
+    torso comes from ``q`` instead and ``torso_position`` is ignored.
+    ``head_position`` is always locked.
     """
 
     max_iterations: int = 500
@@ -94,8 +96,15 @@ class IKOptions:
     frame_gain: float = 1.0
     step_size: float = 1.0
     max_step_norm: float = 0.15
-    # The URDF velocity limits are all zero; this speed (rad/s) replaces them.
+    # The URDF velocity limits are all zero; these speeds (rad/s) replace them.
     default_velocity_limit: float = float(np.pi)
+    torso_velocity_limit: float = 0.5
+    # Active-torso mode: try the arms alone for this many iterations so the
+    # torso stays put whenever the arms can reach; then free the torso.  0
+    # frees it from the start.  torso_step_weight is an extra cost on torso
+    # steps in that phase (it slows convergence near arm singularities).
+    arms_first_iterations: int = 50
+    torso_step_weight: float = 0.0
 
     posture_weight: float = 0.0
     posture_gain: float = 1.0
@@ -103,21 +112,23 @@ class IKOptions:
 
     qp_solver: str | None = None
 
-    # These coordinates exist in the full URDF but are locked in the C++ reduced model.
+    # Locked joint values (torso only in arm-only mode, head always).
     torso_position: tuple[float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0)
     head_position: float = 0.0
 
     def validate(self) -> None:
         """Validate values in place and normalize array-like fields."""
 
-        for name in ("max_iterations", "qp_max_iterations"):
+        for name, minimum in (("max_iterations", 1), ("qp_max_iterations", 1),
+                              ("arms_first_iterations", 0)):
             value = getattr(self, name)
-            if isinstance(value, bool) or int(value) != value or int(value) < 1:
-                raise FairinoConfigurationError(f"{name} must be a positive integer")
+            if isinstance(value, bool) or int(value) != value or int(value) < minimum:
+                raise FairinoConfigurationError(f"{name} must be an integer >= {minimum}")
             setattr(self, name, int(value))
 
         non_negative = (
             "damping",
+            "torso_step_weight",
             "position_cost",
             "orientation_cost",
             "posture_weight",
@@ -128,7 +139,8 @@ class IKOptions:
                 raise FairinoConfigurationError(f"{name} must be finite and non-negative")
             setattr(self, name, value)
 
-        positive = ("tolerance", "dt", "max_step_norm", "default_velocity_limit")
+        positive = ("tolerance", "dt", "max_step_norm", "default_velocity_limit",
+                    "torso_velocity_limit")
         for name in positive:
             value = float(getattr(self, name))
             if not np.isfinite(value) or value <= 0.0:
@@ -189,9 +201,9 @@ class IKOptions:
 
         if self.posture_target is not None:
             posture = np.asarray(self.posture_target, dtype=float).reshape(-1)
-            if posture.shape != (14,) or not np.isfinite(posture).all():
+            if posture.shape not in ((14,), (19,)) or not np.isfinite(posture).all():
                 raise FairinoConfigurationError(
-                    "posture_target must be a finite 14-element vector"
+                    "posture_target must be a finite vector with the model's nq values"
                 )
             self.posture_target = posture.copy()
 
@@ -318,15 +330,21 @@ def _batch_pose_values(value, name):
     return [array[index].reshape(-1).tolist() for index in range(array.shape[0])]
 
 
-def _arm_values(value, name="q"):
+def _q_values(value, nq, name="q"):
     array = np.asarray(value, dtype=float).reshape(-1)
-    if array.shape != (14,) or not np.isfinite(array).all():
-        raise FairinoConfigurationError(f"{name} must be a finite 14-element vector")
+    if array.shape != (nq,) or not np.isfinite(array).all():
+        raise FairinoConfigurationError(f"{name} must be a finite {nq}-element vector")
     return array.tolist()
 
 
 class FairinoQPModel:
-    """14-DoF dual-arm facade. FK, Jacobians and QP iteration run in C++."""
+    """Dual-arm facade. FK, Jacobians and QP iteration run in C++.
+
+    By default the IK moves the 14 arm joints (``q = [left 7, right 7]``).
+    ``active_torso=True`` adds the torso (``q = [left 7, right 7, torso 5]``
+    with the torso in ``TORSO_JOINTS`` order) so it can bend and turn to help
+    the arms reach.
+    """
 
     left_arm_joints = LEFT_ARM_JOINTS
     right_arm_joints = RIGHT_ARM_JOINTS
@@ -334,7 +352,7 @@ class FairinoQPModel:
     head_joint = HEAD_JOINT
 
     def __init__(self, urdf_path=DEFAULT_URDF, *, left_frame=DEFAULT_LEFT_FRAME,
-                 right_frame=DEFAULT_RIGHT_FRAME, base_pose=None):
+                 right_frame=DEFAULT_RIGHT_FRAME, base_pose=None, active_torso=False):
         """``base_pose`` maps base_link into the world frame; ``None`` uses
         :data:`DEFAULT_BASE_POSE` (x forward, y left, z up)."""
         self.urdf_path = Path(urdf_path).expanduser().resolve()
@@ -346,7 +364,8 @@ class FairinoQPModel:
         ).copy()
         try:
             self._native = _native_module().Model(str(self.urdf_path), left_frame, right_frame,
-                                                  _pose_values(self.base_pose, "base_pose"))
+                                                  _pose_values(self.base_pose, "base_pose"),
+                                                  bool(active_torso))
         except ValueError as exc:
             raise FairinoConfigurationError(str(exc)) from exc
 
@@ -363,7 +382,10 @@ class FairinoQPModel:
     def full_nv(self): return self._native.full_nv
 
     @property
-    def joint_names(self): return ARM_JOINTS
+    def active_torso(self): return self._native.active_torso
+
+    @property
+    def joint_names(self): return tuple(self._native.joint_names)
 
     @property
     def joint_limits(self): return np.asarray(self._native.joint_limits)
@@ -374,9 +396,14 @@ class FairinoQPModel:
     @property
     def head_limits(self): return np.asarray(self._native.head_limits)
 
+    def split_q(self, q):
+        """Return ``(left, right, torso)``; ``torso`` is ``None`` in arm-only mode."""
+        q = np.asarray(_q_values(q, self.nq))
+        return q[:7], q[7:14], (q[14:] if self.active_torso else None)
+
     @property
     def velocity_limits(self):
-        """Arm speed limits used with default :class:`IKOptions`."""
+        """Joint speed limits used with default :class:`IKOptions`."""
         return self.effective_velocity_limits()
 
     def effective_velocity_limits(self, options=None):
@@ -394,14 +421,14 @@ class FairinoQPModel:
 
     def full_configuration(self, q, options=None):
         try:
-            return np.asarray(self._native.full_configuration(_arm_values(q), _native_options(options)))
+            return np.asarray(self._native.full_configuration(_q_values(q, self.nq), _native_options(options)))
         except ValueError as exc:
             raise FairinoConfigurationError(str(exc)) from exc
 
     def forward_kinematics(self, q, *, side="left", options=None):
         try:
             return np.asarray(self._native.forward_kinematics(
-                _arm_values(q), str(side).lower(), _native_options(options))).reshape(4, 4)
+                _q_values(q, self.nq), str(side).lower(), _native_options(options))).reshape(4, 4)
         except ValueError as exc:
             raise FairinoConfigurationError(str(exc)) from exc
 
@@ -411,7 +438,7 @@ class FairinoQPModel:
 
     def frame_placements(self, q, options=None):
         try:
-            placements = self._native.frame_placements(_arm_values(q), _native_options(options))
+            placements = self._native.frame_placements(_q_values(q, self.nq), _native_options(options))
         except ValueError as exc:
             raise FairinoConfigurationError(str(exc)) from exc
         return {name: np.asarray(pose).reshape(4, 4) for name, pose in placements.items()}
@@ -425,7 +452,7 @@ class FairinoQPModel:
         if solver is not None: overrides["qp_solver"] = solver
         options = replace(options, **overrides)
         native_options = _native_options(options)
-        seed = [0.0] * 14 if q_seed is None else _arm_values(q_seed, "q_seed")
+        seed = [0.0] * self.nq if q_seed is None else _q_values(q_seed, self.nq, "q_seed")
         try:
             native_result = self._native.solve_ik(_pose_values(left_target, "left_target"),
                 _pose_values(right_target, "right_target"), seed, native_options)
@@ -462,12 +489,12 @@ class FairinoQPModel:
                 "left_targets and right_targets must have the same non-zero batch size"
             )
         if q_seeds is None:
-            seeds = [[0.0] * 14 for _ in left]
+            seeds = [[0.0] * self.nq for _ in left]
         else:
             seed_array = np.asarray(q_seeds, dtype=float)
-            if seed_array.shape != (len(left), 14) or not np.isfinite(seed_array).all():
+            if seed_array.shape != (len(left), self.nq) or not np.isfinite(seed_array).all():
                 raise FairinoConfigurationError(
-                    f"q_seeds must have shape ({len(left)}, 14) and contain finite values"
+                    f"q_seeds must have shape ({len(left)}, {self.nq}) and contain finite values"
                 )
             seeds = seed_array.tolist()
         try:

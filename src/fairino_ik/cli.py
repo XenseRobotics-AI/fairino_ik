@@ -3,7 +3,8 @@
 
 The command operates on the fourteen serial arm joints (left j1..j7 followed
 by right j8..j14).  The torso (j20, j19, j18, j16, j15), head (j17) and wheels
-remain fixed; ``--torso`` and ``--head`` choose where they are locked.
+remain fixed; ``--torso`` and ``--head`` choose where they are locked.  With
+``--active-torso`` the IK also moves the torso and ``--torso`` is its seed.
 ``--left-frame``/``--right-frame`` can be changed to ``left_flange`` and
 ``right_flange`` when the flange is the desired tool reference.
 
@@ -18,6 +19,10 @@ Examples::
         --right-target 0.626 -0.2354 0.905 0.7854 0 -1.5708 \\
         --q 0 30 0 60 0 30 0  0 30 0 60 0 30 0
     python examples/dual_arm_ik.py --torso 0 0 0 0 0.3
+    python examples/dual_arm_ik.py --active-torso \\
+        --left-target 0.7507 0.2354 0.5038 0.2618 0 1.5708 \\
+        --right-target 0.7507 -0.2354 0.5038 -0.2618 0 -1.5708 \\
+        --q 0 45 0 90 0 45 0  0 45 0 90 0 45 0
 """
 
 from __future__ import annotations
@@ -95,6 +100,15 @@ def _parser() -> argparse.ArgumentParser:
         help="arm joint speed in rad/s (the URDF limits are zero)",
     )
     parser.add_argument("--no-body-avoidance", action="store_true")
+    parser.add_argument(
+        "--active-torso", action="store_true",
+        help="let the IK move the torso too (19 DoF); --torso is then the seed",
+    )
+    parser.add_argument(
+        "--arms-first-iterations", type=int, default=50,
+        help="iterations with the torso fixed before it is freed (0: free at once)",
+    )
+    parser.add_argument("--torso-step-weight", type=float, default=0.0)
     parser.add_argument("--solver", default="eiquadprog", help="native C++ backend")
     parser.add_argument("--print-full-q", action="store_true")
     return parser
@@ -108,12 +122,15 @@ def main() -> int:
         left_frame=args.left_frame,
         right_frame=args.right_frame,
         base_pose=URDF_BASE_POSE if args.urdf_base_frame else None,
+        active_torso=args.active_torso,
     )
     q_seed = (
         np.zeros(14, dtype=float)
         if args.q is None
         else np.radians(np.asarray(args.q, dtype=float))
     )
+    if model.active_torso:
+        q_seed = np.concatenate((q_seed, np.asarray(args.torso, dtype=float)))
     options = IKOptions(
         max_iterations=args.max_iterations,
         tolerance=args.tolerance,
@@ -123,6 +140,8 @@ def main() -> int:
         posture_weight=args.posture_cost,
         default_velocity_limit=args.velocity_limit,
         body_avoidance=not args.no_body_avoidance,
+        torso_step_weight=args.torso_step_weight,
+        arms_first_iterations=args.arms_first_iterations,
         qp_solver=args.solver,
         torso_position=tuple(args.torso),
         head_position=args.head,
@@ -132,6 +151,7 @@ def main() -> int:
         # no-op by generating two nearby, reachable targets with FK.
         demo_q = np.radians(
             [4, -4, 3, 2, -2, 2, 3, -4, 4, -3, -2, 2, -2, 3]
+            + ([2, 3, -2, 1, 4] if model.active_torso else [])
         )
         demo_q = np.clip(
             demo_q,
@@ -158,7 +178,10 @@ def main() -> int:
     result = model.solve_ik(left_target, right_target, q_seed, options)
     print(f"URDF: {model.urdf_path}")
     print(f"frames: left={model.left_frame}, right={model.right_frame}")
-    print(f"torso {TORSO_JOINTS} [rad]: {options.torso_position}, head j17: {options.head_position}")
+    if model.active_torso:
+        print(f"mode: arms + torso ({model.nq} DoF), head j17: {options.head_position}")
+    else:
+        print(f"torso {TORSO_JOINTS} [rad]: {options.torso_position}, head j17: {options.head_position}")
     print(f"backend: C++ QP / {result.solver}")
     print(f"success: {result.success} ({result.status})")
     print(f"iterations: {result.iterations}")
@@ -178,7 +201,9 @@ def main() -> int:
             f"torso clearance [m]: {result.body_min_distance:.4f} "
             f"({result.body_nearest_segment})"
         )
-    print("q [deg]:", np.array2string(np.degrees(result.q), precision=6))
+    print("arms q [deg]:", np.array2string(np.degrees(result.q[:14]), precision=6))
+    if model.active_torso:
+        print(f"torso {TORSO_JOINTS} [deg]:", np.array2string(np.degrees(result.q[14:]), precision=6))
     if result.message:
         print(f"message: {result.message}")
     if args.print_full_q and result.full_q is not None:
