@@ -1,0 +1,823 @@
+#!/usr/bin/env python3
+"""Slider-based Qt control panel for C++ QP Fairino dual-arm IK.
+
+The FK tab contains seven joint sliders for each arm plus the torso/head
+joints, which stay locked during IK.  The IK tab contains independent XYZ and
+rotation sliders and separate left/right/both solve buttons.  Joint angles are
+shown in degrees.
+
+Target orientation is not edited as absolute roll/pitch/yaw: those angles lock
+at pitch = +-90 deg, which is exactly where a vertical tool lands.  The rotation
+sliders instead give a rotation vector about the fixed world x/y/z axes,
+applied to the orientation captured at the last FK sync.  That map has no
+singularity inside the slider range.
+
+Examples::
+
+    python examples/dual_arm_qt.py
+    python examples/dual_arm_qt.py --no-meshcat
+    python examples/dual_arm_qt.py \
+        --initial-q 0 45 0 90 0 45 0  0 45 0 90 0 45 0
+
+For a headless construction check, use ``QT_QPA_PLATFORM=offscreen`` together
+with ``--no-show``.  A normal desktop session is required for interaction.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import replace
+import math
+from pathlib import Path
+import sys
+import time
+from typing import Any, Callable, Iterable
+
+import numpy as np
+
+
+from .solver import (
+    DEFAULT_LEFT_FRAME,
+    DEFAULT_RIGHT_FRAME,
+    DEFAULT_URDF,
+    FairinoQPModel,
+    HEAD_JOINT,
+    IKOptions,
+    TORSO_JOINTS,
+    URDF_BASE_POSE,
+    available_qp_solvers,
+)
+from .runtime import reexec_without_ros
+
+
+def _pose_from_xyz_rpy(values: Iterable[float]) -> np.ndarray:
+    """Build a base-frame pose from x, y, z, roll, pitch, yaw (radians)."""
+
+    x, y, z, roll, pitch, yaw = (float(value) for value in values)
+    cx, sx = math.cos(roll), math.sin(roll)
+    cy, sy = math.cos(pitch), math.sin(pitch)
+    cz, sz = math.cos(yaw), math.sin(yaw)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
+    ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+    rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+    pose = np.eye(4, dtype=float)
+    pose[:3, :3] = rz @ ry @ rx
+    pose[:3, 3] = [x, y, z]
+    return pose
+
+
+def _rpy_from_rotation(rotation: np.ndarray) -> tuple[float, float, float]:
+    matrix = np.asarray(rotation, dtype=float)
+    pitch = float(np.arcsin(np.clip(-matrix[2, 0], -1.0, 1.0)))
+    cp = float(np.cos(pitch))
+    if abs(cp) > 1e-8:
+        roll = float(np.arctan2(matrix[2, 1], matrix[2, 2]))
+        yaw = float(np.arctan2(matrix[1, 0], matrix[0, 0]))
+    else:
+        roll = 0.0
+        yaw = float(np.arctan2(-matrix[0, 1], matrix[1, 1]))
+    return roll, pitch, yaw
+
+
+def _rotation_from_vector(vector: Iterable[float]) -> np.ndarray:
+    """Rodrigues' formula: the rotation by ``|vector|`` about its direction."""
+
+    vector = np.asarray(vector, dtype=float).reshape(3)
+    angle = float(np.linalg.norm(vector))
+    if angle < 1e-12:
+        return np.eye(3)
+    axis = vector / angle
+    skew = np.array(
+        [[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]]
+    )
+    return np.eye(3) + math.sin(angle) * skew + (1.0 - math.cos(angle)) * skew @ skew
+
+
+def _pose_values(pose: np.ndarray) -> list[float]:
+    roll, pitch, yaw = _rpy_from_rotation(np.asarray(pose)[:3, :3])
+    return [
+        float(pose[0, 3]),
+        float(pose[1, 3]),
+        float(pose[2, 3]),
+        roll,
+        pitch,
+        yaw,
+    ]
+
+
+def _load_qt() -> dict[str, Any]:
+    """Load optional Qt symbols lazily."""
+
+    try:
+        from PySide6.QtCore import QSignalBlocker, Qt, QTimer, QUrl
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtWidgets import (
+            QApplication,
+            QComboBox,
+            QDoubleSpinBox,
+            QGroupBox,
+            QHBoxLayout,
+            QLabel,
+            QMainWindow,
+            QPushButton,
+            QSlider,
+            QTabWidget,
+            QVBoxLayout,
+            QWidget,
+        )
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError(
+            "This example requires PySide6. Install it in the active environment."
+        ) from exc
+    return locals()
+
+
+def _available_qp_solvers() -> list[str]:
+    """Return installed native C++ backends, using native eiquadprog."""
+
+    available = sorted(available_qp_solvers())
+    if not available:
+        raise RuntimeError("Native QP extension is unavailable")
+    preferred = [name for name in ("eiquadprog",) if name in available]
+    return preferred + [name for name in available if name not in preferred]
+
+
+class SliderControl:
+    """Floating-point slider with a synchronized numeric spin box."""
+
+    def __init__(
+        self,
+        qt: dict[str, Any],
+        label: str,
+        minimum: float,
+        maximum: float,
+        value: float,
+        *,
+        decimals: int,
+        single_step: float,
+        suffix: str,
+    ) -> None:
+        if not minimum < maximum:
+            raise ValueError(f"invalid slider range for {label}: {minimum}, {maximum}")
+        self._qt = qt
+        self._minimum = float(minimum)
+        self._maximum = float(maximum)
+        self._slider_steps = 20_000
+        self._callbacks: list[Callable[[float], None]] = []
+        self.name_label = qt["QLabel"](label)
+        self.name_label.setMinimumWidth(118)
+        self.slider = qt["QSlider"](qt["Qt"].Orientation.Horizontal)
+        self.slider.setRange(0, self._slider_steps)
+        self.slider.setTracking(True)
+        self.spin_box = qt["QDoubleSpinBox"]()
+        self.spin_box.setRange(self._minimum, self._maximum)
+        self.spin_box.setDecimals(decimals)
+        self.spin_box.setSingleStep(single_step)
+        self.spin_box.setSuffix(suffix)
+        self.spin_box.setKeyboardTracking(True)
+        self.spin_box.setMinimumWidth(125)
+        layout = qt["QHBoxLayout"]()
+        layout.setContentsMargins(0, 1, 0, 1)
+        layout.addWidget(self.name_label)
+        layout.addWidget(self.slider, 1)
+        layout.addWidget(self.spin_box)
+        self.widget = qt["QWidget"]()
+        self.widget.setLayout(layout)
+        self.slider.valueChanged.connect(self._on_slider)
+        self.spin_box.valueChanged.connect(self._on_spin)
+        self.set_value(value)
+
+    def connect(self, callback: Callable[[float], None]) -> None:
+        self._callbacks.append(callback)
+
+    def _position_from_value(self, value: float) -> int:
+        ratio = (value - self._minimum) / (self._maximum - self._minimum)
+        return int(round(float(np.clip(ratio, 0.0, 1.0)) * self._slider_steps))
+
+    def _value_from_position(self, position: int) -> float:
+        ratio = float(position) / self._slider_steps
+        return self._minimum + ratio * (self._maximum - self._minimum)
+
+    def _emit(self, value: float) -> None:
+        for callback in tuple(self._callbacks):
+            callback(float(value))
+
+    def _on_slider(self, position: int) -> None:
+        blocker = self._qt["QSignalBlocker"](self.spin_box)
+        value = self._value_from_position(position)
+        self.spin_box.setValue(value)
+        del blocker
+        self._emit(value)
+
+    def _on_spin(self, value: float) -> None:
+        blocker = self._qt["QSignalBlocker"](self.slider)
+        self.slider.setValue(self._position_from_value(float(value)))
+        del blocker
+        self._emit(float(value))
+
+    def value(self) -> float:
+        return float(self.spin_box.value())
+
+    def set_value(self, value: float, *, emit: bool = False) -> None:
+        value = float(np.clip(value, self._minimum, self._maximum))
+        slider_blocker = self._qt["QSignalBlocker"](self.slider)
+        spin_blocker = self._qt["QSignalBlocker"](self.spin_box)
+        self.slider.setValue(self._position_from_value(value))
+        self.spin_box.setValue(value)
+        del slider_blocker, spin_blocker
+        if emit:
+            self._emit(value)
+
+
+class _JointPanel:
+    def __init__(
+        self,
+        qt: dict[str, Any],
+        title: str,
+        joint_names: Iterable[str],
+        limits: np.ndarray,
+        labels: Iterable[str] | None = None,
+    ) -> None:
+        self.qt = qt
+        self.controls: list[SliderControl] = []
+        group = qt["QGroupBox"](title)
+        layout = qt["QVBoxLayout"](group)
+        joint_names = tuple(joint_names)
+        labels = (
+            tuple(f"J{index + 1} {name}" for index, name in enumerate(joint_names))
+            if labels is None else tuple(labels)
+        )
+        for label, limit in zip(labels, limits, strict=True):
+            control = SliderControl(
+                qt,
+                label,
+                math.degrees(float(limit[0])),
+                math.degrees(float(limit[1])),
+                0.0,
+                decimals=2,
+                single_step=0.1,
+                suffix=" deg",
+            )
+            self.controls.append(control)
+            layout.addWidget(control.widget)
+        self.widget = group
+
+    def connect(self, callback: Callable[[float], None]) -> None:
+        for control in self.controls:
+            control.connect(callback)
+
+    def set_q(self, q: Iterable[float]) -> None:
+        for control, value in zip(self.controls, np.degrees(list(q)), strict=True):
+            control.set_value(float(value))
+
+    def q(self) -> np.ndarray:
+        return np.radians([control.value() for control in self.controls])
+
+
+class _PosePanel:
+    """Absolute XYZ plus a world-axis rotation offset from a reference.
+
+    ``pose()`` is ``exp([rx, ry, rz]) @ R_ref``.  ``set_pose`` stores the new
+    reference and zeroes the rotation sliders, so a single rotation slider
+    always turns the target about one fixed world axis.
+    """
+
+    SPECS = (
+        ("x", -1.5, 1.5, 4, 0.001, " m"),
+        ("y", -1.5, 1.5, 4, 0.001, " m"),
+        ("z", 0.0, 2.2, 4, 0.001, " m"),
+        ("rot x", -180.0, 180.0, 2, 0.5, " deg"),
+        ("rot y", -180.0, 180.0, 2, 0.5, " deg"),
+        ("rot z", -180.0, 180.0, 2, 0.5, " deg"),
+    )
+
+    def __init__(self, qt: dict[str, Any], title: str) -> None:
+        self.qt = qt
+        self.controls: dict[str, SliderControl] = {}
+        self._reference = np.eye(3)
+        group = qt["QGroupBox"](title)
+        layout = qt["QVBoxLayout"](group)
+        for name, minimum, maximum, decimals, step, suffix in self.SPECS:
+            control = SliderControl(
+                qt, name, minimum, maximum, 0.0,
+                decimals=decimals, single_step=step, suffix=suffix,
+            )
+            self.controls[name] = control
+            layout.addWidget(control.widget)
+        self.rpy_label = qt["QLabel"]()
+        self.rpy_label.setStyleSheet("font-family: monospace;")
+        layout.addWidget(self.rpy_label)
+        self.widget = group
+        self.connect(lambda _value: self._update_rpy_label())
+        self._update_rpy_label()
+
+    def connect(self, callback: Callable[[float], None]) -> None:
+        for control in self.controls.values():
+            control.connect(callback)
+
+    def set_pose(self, pose: np.ndarray) -> None:
+        pose = np.asarray(pose, dtype=float)
+        self._reference = pose[:3, :3].copy()
+        for name, value in zip(("x", "y", "z"), pose[:3, 3], strict=True):
+            self.controls[name].set_value(float(value))
+        for name in ("rot x", "rot y", "rot z"):
+            self.controls[name].set_value(0.0)
+        self._update_rpy_label()
+
+    def pose(self) -> np.ndarray:
+        offset = np.radians([self.controls[name].value() for name in ("rot x", "rot y", "rot z")])
+        pose = np.eye(4)
+        pose[:3, :3] = _rotation_from_vector(offset) @ self._reference
+        pose[:3, 3] = [self.controls[name].value() for name in ("x", "y", "z")]
+        return pose
+
+    def _update_rpy_label(self) -> None:
+        # Read-only display; near pitch = +-90 deg roll and yaw are ambiguous.
+        roll, pitch, yaw = np.degrees(_rpy_from_rotation(self.pose()[:3, :3]))
+        self.rpy_label.setText(
+            f"target RPY (display only): {roll:7.2f} {pitch:7.2f} {yaw:7.2f} deg"
+        )
+
+
+# Zero is singular: every arm is stretched with j1/j3/j5 collinear, so the
+# Jacobian has rank 4 and some target rotations cannot be followed.  Start
+# with bent elbows and wrists (hands in front of the body) instead.
+_READY_Q_DEG = (0.0, 45.0, 0.0, 90.0, 0.0, 45.0, 0.0) * 2
+
+
+_TORSO_LABELS = (
+    "j20 lower leg",
+    "j19 knee",
+    "j18 hip",
+    "j16 waist",
+    "j15 body yaw",
+    "j17 head yaw",
+)
+
+
+class FairinoIKWindow:
+    """FK/IK slider window for the two serial Fairino arms."""
+
+    @staticmethod
+    def create(
+        qt: dict[str, Any],
+        model: FairinoQPModel,
+        options: IKOptions,
+        *,
+        initial_q: np.ndarray,
+        visualizer: object | None = None,
+        ik_update_hz: float = 30.0,
+        smooth_time: float = 0.12,
+        qp_solver: str = "eiquadprog",
+    ):
+        class _Window(qt["QMainWindow"]):
+            def __init__(self) -> None:
+                super().__init__()
+                self.qt = qt
+                self.model = model
+                self.options = options
+                self.visualizer = visualizer
+                self.ik_update_hz = float(ik_update_hz)
+                self.smooth_time = float(smooth_time)
+                self.qp_solver = str(qp_solver)
+                self._syncing = False
+                self._pending_sides: set[str] = set()
+                self.goal_q = np.clip(
+                    np.asarray(initial_q, dtype=float).reshape(14),
+                    model.joint_limits[:, 0], model.joint_limits[:, 1],
+                )
+                self.display_q = self.goal_q.copy()
+                self._animation_start = self.display_q.copy()
+                self._animation_started = time.monotonic()
+                self.setWindowTitle("Fairino C++ QP Dual-Arm FK / IK")
+                self.resize(1200, 900)
+                self._build_ui()
+                self._reset_from_q()
+
+                self.fk_timer = qt["QTimer"](self)
+                self.fk_timer.setSingleShot(True)
+                self.fk_timer.setInterval(20)
+                self.fk_timer.timeout.connect(self._apply_fk_from_sliders)
+                self.torso_timer = qt["QTimer"](self)
+                self.torso_timer.setSingleShot(True)
+                self.torso_timer.setInterval(20)
+                self.torso_timer.timeout.connect(self._apply_torso_from_sliders)
+                self.ik_timer = qt["QTimer"](self)
+                self.ik_timer.setSingleShot(True)
+                self.ik_timer.setInterval(max(1, round(1000.0 / self.ik_update_hz)))
+                self.ik_timer.timeout.connect(self._solve_pending)
+                self.render_timer = qt["QTimer"](self)
+                self.render_timer.setInterval(16)
+                self.render_timer.timeout.connect(self._render)
+                self.render_timer.start()
+
+            def _build_ui(self) -> None:
+                central = self.qt["QWidget"]()
+                root = self.qt["QVBoxLayout"](central)
+                title = self.qt["QLabel"]("Fairino 轮腿双臂 FK / IK 滑动条控制")
+                title.setStyleSheet("font-size: 20px; font-weight: 600;")
+                root.addWidget(title)
+                root.addWidget(self.qt["QLabel"](f"URDF: {model.urdf_path}"))
+                mesh_row = self.qt["QHBoxLayout"]()
+                self.mesh_label = self.qt["QLabel"](
+                    f"MeshCat: {visualizer.url}" if visualizer is not None else "MeshCat: disabled"
+                )
+                mesh_row.addWidget(self.mesh_label, 1)
+                self.open_mesh_button = self.qt["QPushButton"]("Open MeshCat")
+                self.open_mesh_button.setEnabled(visualizer is not None)
+                self.open_mesh_button.clicked.connect(self._open_meshcat)
+                mesh_row.addWidget(self.open_mesh_button)
+                root.addLayout(mesh_row)
+
+                solver_row = self.qt["QHBoxLayout"]()
+                solver_row.addWidget(self.qt["QLabel"]("IK backend: C++ QP"))
+                solver_row.addStretch(1)
+                solver_row.addWidget(self.qt["QLabel"]("QP solver:"))
+                self.qp_solver_combo = self.qt["QComboBox"]()
+                for solver_name in _available_qp_solvers():
+                    self.qp_solver_combo.addItem(solver_name, solver_name)
+                selected_index = self.qp_solver_combo.findData(self.qp_solver)
+                if selected_index < 0:
+                    selected_index = 0
+                self.qp_solver_combo.setCurrentIndex(selected_index)
+                self.qp_solver = str(self.qp_solver_combo.currentData())
+                self.qp_solver_combo.currentIndexChanged.connect(
+                    self._on_qp_solver_changed
+                )
+                solver_row.addWidget(self.qp_solver_combo)
+                root.addLayout(solver_row)
+
+                tabs = self.qt["QTabWidget"]()
+                fk_page = self.qt["QWidget"]()
+                fk_layout = self.qt["QVBoxLayout"](fk_page)
+                fk_layout.addWidget(self.qt["QLabel"](
+                    "FK：拖动左右臂关节滑条；Apply FK 会更新两侧末端目标。"
+                    "躯干/头部在 IK 中锁定，改变后两侧目标随之同步。"
+                ))
+                joint_row = self.qt["QHBoxLayout"]()
+                limits = np.asarray(model.joint_limits, dtype=float)
+                self.left_joints = _JointPanel(qt, "Left arm joints", model.left_arm_joints, limits[:7])
+                self.right_joints = _JointPanel(qt, "Right arm joints", model.right_arm_joints, limits[7:])
+                torso_limits = np.vstack((model.torso_limits, model.head_limits))
+                self.torso_joints = _JointPanel(
+                    qt, "Torso / head (locked during IK)",
+                    TORSO_JOINTS + (HEAD_JOINT,), torso_limits, _TORSO_LABELS,
+                )
+                self.torso_joints.set_q(
+                    tuple(self.options.torso_position) + (self.options.head_position,)
+                )
+                joint_row.addWidget(self.left_joints.widget)
+                joint_row.addWidget(self.right_joints.widget)
+                fk_layout.addLayout(joint_row)
+                fk_layout.addWidget(self.torso_joints.widget)
+                fk_buttons = self.qt["QHBoxLayout"]()
+                apply_left = self.qt["QPushButton"]("Apply left FK")
+                apply_right = self.qt["QPushButton"]("Apply right FK")
+                apply_both = self.qt["QPushButton"]("Apply both FK")
+                apply_left.clicked.connect(lambda: self._apply_fk_from_sliders("left"))
+                apply_right.clicked.connect(lambda: self._apply_fk_from_sliders("right"))
+                apply_both.clicked.connect(self._apply_fk_from_sliders)
+                fk_buttons.addWidget(apply_left)
+                fk_buttons.addWidget(apply_right)
+                fk_buttons.addWidget(apply_both)
+                fk_layout.addLayout(fk_buttons)
+                self.fk_status = self.qt["QLabel"]()
+                self.fk_status.setWordWrap(True)
+                self.fk_status.setStyleSheet("font-family: monospace;")
+                fk_layout.addWidget(self.fk_status)
+                fk_layout.addStretch(1)
+                tabs.addTab(fk_page, "FK - joint sliders")
+
+                ik_page = self.qt["QWidget"]()
+                ik_layout = self.qt["QVBoxLayout"](ik_page)
+                ik_layout.addWidget(self.qt["QLabel"](
+                    "IK：拖动左/右 XYZ 和旋转滑条；坐标 x 前 / y 左 / z 上，平移单位米。"
+                    "rot x/y/z 是绕世界固定轴、相对上次同步姿态的旋转（度），没有万向锁。"
+                ))
+                pose_row = self.qt["QHBoxLayout"]()
+                self.left_pose = _PosePanel(qt, "Left arm target")
+                self.right_pose = _PosePanel(qt, "Right arm target")
+                pose_row.addWidget(self.left_pose.widget)
+                pose_row.addWidget(self.right_pose.widget)
+                ik_layout.addLayout(pose_row)
+                self.left_pose.connect(lambda _value: self._schedule_ik("left"))
+                self.right_pose.connect(lambda _value: self._schedule_ik("right"))
+                ik_buttons = self.qt["QHBoxLayout"]()
+                solve_left = self.qt["QPushButton"]("Solve left arm")
+                solve_right = self.qt["QPushButton"]("Solve right arm")
+                solve_both = self.qt["QPushButton"]("Solve both arms")
+                sync = self.qt["QPushButton"]("Sync targets from current FK")
+                solve_left.clicked.connect(lambda: self._solve("left"))
+                solve_right.clicked.connect(lambda: self._solve("right"))
+                solve_both.clicked.connect(lambda: self._solve("both"))
+                sync.clicked.connect(self._reset_from_q)
+                ik_buttons.addWidget(solve_left)
+                ik_buttons.addWidget(solve_right)
+                ik_buttons.addWidget(solve_both)
+                ik_buttons.addWidget(sync)
+                ik_layout.addLayout(ik_buttons)
+                self.ik_status = self.qt["QLabel"]()
+                self.ik_status.setWordWrap(True)
+                self.ik_status.setStyleSheet("font-family: monospace;")
+                ik_layout.addWidget(self.ik_status)
+                ik_layout.addStretch(1)
+                tabs.addTab(ik_page, "IK - XYZ / RPY sliders")
+                root.addWidget(tabs, 1)
+                reset = self.qt["QPushButton"]("Reset targets / sliders")
+                reset.clicked.connect(self._reset_from_q)
+                root.addWidget(reset)
+                self.setCentralWidget(central)
+                self.left_joints.connect(lambda _value: self._schedule_fk())
+                self.right_joints.connect(lambda _value: self._schedule_fk())
+                self.torso_joints.connect(lambda _value: self._schedule_torso())
+
+            def _update_view(self, q: np.ndarray) -> None:
+                if self.visualizer is not None:
+                    try:
+                        self.visualizer.update(q, self.options)
+                    except Exception as exc:  # pragma: no cover
+                        self.mesh_label.setText(f"MeshCat update failed: {exc}")
+
+            def _render(self) -> None:
+                if self.smooth_time <= 0.0:
+                    self.display_q = self.goal_q.copy()
+                else:
+                    progress = float(np.clip(
+                        (time.monotonic() - self._animation_started) / self.smooth_time,
+                        0.0, 1.0,
+                    ))
+                    smooth = progress * progress * progress * (10.0 + progress * (-15.0 + 6.0 * progress))
+                    self.display_q = self._animation_start + smooth * (self.goal_q - self._animation_start)
+                self._update_view(self.display_q)
+
+            def _set_goal(self, q: np.ndarray, *, immediate: bool = False) -> None:
+                q = np.asarray(q, dtype=float).reshape(14)
+                if immediate or self.smooth_time <= 0.0:
+                    self.goal_q = q.copy()
+                    self.display_q = q.copy()
+                    self._animation_start = q.copy()
+                else:
+                    self._animation_start = self.display_q.copy()
+                    self.goal_q = q.copy()
+                    self._animation_started = time.monotonic()
+                if immediate:
+                    self._animation_started = time.monotonic()
+                self._sync_joint_sliders()
+                self._update_view(self.display_q)
+
+            def _sync_joint_sliders(self) -> None:
+                self._syncing = True
+                try:
+                    self.left_joints.set_q(self.goal_q[:7])
+                    self.right_joints.set_q(self.goal_q[7:])
+                finally:
+                    self._syncing = False
+
+            def _reset_from_q(self) -> None:
+                self._set_goal(self.goal_q, immediate=True)
+                self._sync_targets()
+                self.fk_status.setText("Targets synchronized from current joint sliders.")
+                self.ik_status.setText("Ready. Drag a target slider or press a solve button.")
+
+            def _sync_targets(self) -> None:
+                self._syncing = True
+                try:
+                    self.left_pose.set_pose(model.forward_kinematics(self.goal_q, side="left", options=self.options))
+                    self.right_pose.set_pose(model.forward_kinematics(self.goal_q, side="right", options=self.options))
+                finally:
+                    self._syncing = False
+
+            def _schedule_torso(self) -> None:
+                if self._syncing:
+                    return
+                self.torso_timer.start()
+
+            def _apply_torso_from_sliders(self) -> None:
+                values = self.torso_joints.q()
+                self.options = replace(
+                    self.options,
+                    torso_position=tuple(float(value) for value in values[:-1]),
+                    head_position=float(values[-1]),
+                )
+                # The arms keep their joint angles and ride along with the
+                # torso, so the IK targets follow the new FK poses.
+                self._sync_targets()
+                self._update_view(self.display_q)
+                self.fk_status.setText(
+                    "Torso/head locked at [deg] = "
+                    + np.array2string(np.degrees(values), precision=2, suppress_small=True)
+                )
+
+            def _schedule_fk(self, _value: float | None = None) -> None:
+                if self._syncing:
+                    return
+                self.ik_timer.stop()
+                self.fk_timer.start()
+
+            def _apply_fk_from_sliders(self, side: str | None = None) -> None:
+                self.fk_timer.stop()
+                left = self.left_joints.q()
+                right = self.right_joints.q()
+                if side == "left":
+                    q = np.concatenate((left, self.goal_q[7:]))
+                elif side == "right":
+                    q = np.concatenate((self.goal_q[:7], right))
+                else:
+                    q = np.concatenate((left, right))
+                q = np.clip(q, model.joint_limits[:, 0], model.joint_limits[:, 1])
+                self._set_goal(q, immediate=True)
+                self._syncing = True
+                try:
+                    if side != "right":
+                        self.left_pose.set_pose(model.forward_kinematics(q, side="left", options=self.options))
+                    if side != "left":
+                        self.right_pose.set_pose(model.forward_kinematics(q, side="right", options=self.options))
+                finally:
+                    self._syncing = False
+                self.fk_status.setText(
+                    "FK applied: q [deg] = "
+                    + np.array2string(np.degrees(q), precision=2, suppress_small=True)
+                )
+
+            def _schedule_ik(self, side: str) -> None:
+                if self._syncing:
+                    return
+                self._pending_sides.add(side)
+                self.fk_timer.stop()
+                if not self.ik_timer.isActive():
+                    self.ik_timer.start()
+                self.ik_status.setText("Solving latest target...")
+
+            def _on_qp_solver_changed(self, _index: int) -> None:
+                selected = self.qp_solver_combo.currentData()
+                if not selected:
+                    return
+                self.qp_solver = str(selected)
+                self.ik_status.setText(f"C++ QP solver selected: {self.qp_solver}")
+
+            def _solve_pending(self) -> None:
+                sides = self._pending_sides or {"both"}
+                self._pending_sides.clear()
+                if sides == {"left"}:
+                    self._solve("left")
+                elif sides == {"right"}:
+                    self._solve("right")
+                else:
+                    self._solve("both")
+
+            def _solve(self, side: str) -> None:
+                try:
+                    left_target = self.left_pose.pose()
+                    right_target = self.right_pose.pose()
+                    if side == "left":
+                        right_target = model.forward_kinematics(self.goal_q, side="right", options=self.options)
+                    elif side == "right":
+                        left_target = model.forward_kinematics(self.goal_q, side="left", options=self.options)
+                    result = model.solve_ik(
+                        left_target,
+                        right_target,
+                        self.goal_q,
+                        self.options,
+                        dt=1.0 / self.ik_update_hz,
+                        solver=self.qp_solver,
+                    )
+                    if np.isfinite(result.q).all():
+                        self._set_goal(result.q)
+                    self.ik_status.setText(
+                        f"{side} solve: {result.status}, success={result.success}, "
+                        f"iterations={result.iterations}\n"
+                        f"position={result.position_error:.3e} m, "
+                        f"orientation={result.orientation_error:.3e} rad, "
+                        f"torso clearance={result.body_min_distance:.3f} m\n"
+                        f"q [deg] = {np.array2string(np.degrees(result.q), precision=2, suppress_small=True)}"
+                    )
+                    self.ik_status.setStyleSheet(
+                        "font-family: monospace; color: #1b7f2a;"
+                        if result.success else "font-family: monospace; color: #b00020;"
+                    )
+                except Exception as exc:  # pragma: no cover
+                    self.ik_status.setText(f"IK failed: {exc}")
+                    self.ik_status.setStyleSheet("font-family: monospace; color: #b00020;")
+
+            def _open_meshcat(self) -> None:
+                if self.visualizer is not None:
+                    qt["QDesktopServices"].openUrl(qt["QUrl"](str(self.visualizer.url)))
+
+        return _Window()
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
+    parser.add_argument("--left-frame", default=DEFAULT_LEFT_FRAME)
+    parser.add_argument("--right-frame", default=DEFAULT_RIGHT_FRAME)
+    parser.add_argument(
+        "--urdf-base-frame", action="store_true",
+        help="use raw base_link axes (forward is -y) instead of x forward",
+    )
+    parser.add_argument("--max-iterations", type=int, default=500)
+    parser.add_argument("--tolerance", type=float, default=1e-5)
+    parser.add_argument("--damping", type=float, default=1e-5)
+    parser.add_argument("--posture-cost", type=float, default=0.0)
+    parser.add_argument(
+        "--velocity-limit", type=float, default=float(np.pi),
+        help="arm joint speed in rad/s (the URDF limits are zero)",
+    )
+    parser.add_argument(
+        "--torso", type=float, nargs=len(TORSO_JOINTS), metavar="RAD",
+        default=[0.0] * len(TORSO_JOINTS),
+        help="initial locked torso joints " + " ".join(TORSO_JOINTS) + " (radians)",
+    )
+    parser.add_argument("--head", type=float, default=0.0, help="initial head yaw j17 (radians)")
+    parser.add_argument("--no-body-avoidance", action="store_true")
+    parser.add_argument(
+        "--solver",
+        default="eiquadprog",
+        help="native C++ backend shown initially in the GUI (default: eiquadprog)",
+    )
+    parser.add_argument("--ik-update-hz", type=float, default=30.0)
+    parser.add_argument("--smooth-time", type=float, default=0.12)
+    parser.add_argument("--initial-q", type=float, nargs=14, metavar="DEG", default=None)
+    parser.add_argument("--no-meshcat", action="store_true")
+    parser.add_argument("--no-open-browser", action="store_true")
+    parser.add_argument("--no-show", action="store_true")
+    return parser
+
+
+def run(args: argparse.Namespace) -> int:
+    qt = _load_qt()
+    try:
+        model = FairinoQPModel(
+            args.urdf, left_frame=args.left_frame, right_frame=args.right_frame,
+            base_pose=URDF_BASE_POSE if args.urdf_base_frame else None,
+        )
+        available_solvers = _available_qp_solvers()
+        if args.solver not in available_solvers:
+            raise ValueError(
+                f"QP solver {args.solver!r} is unavailable; installed: "
+                + ", ".join(available_solvers)
+            )
+        options = IKOptions(
+            max_iterations=args.max_iterations,
+            tolerance=args.tolerance,
+            damping=args.damping,
+            posture_weight=args.posture_cost,
+            dt=1.0 / args.ik_update_hz,
+            default_velocity_limit=args.velocity_limit,
+            body_avoidance=not args.no_body_avoidance,
+            qp_solver=args.solver,
+            torso_position=tuple(args.torso),
+            head_position=args.head,
+        )
+        options.validate()
+        if not np.isfinite(args.ik_update_hz) or args.ik_update_hz <= 0:
+            raise ValueError("--ik-update-hz must be positive")
+        if not np.isfinite(args.smooth_time) or args.smooth_time < 0:
+            raise ValueError("--smooth-time must be non-negative")
+        initial_q = np.radians(
+            _READY_Q_DEG if args.initial_q is None else np.asarray(args.initial_q, dtype=float)
+        )
+        if initial_q.shape != (14,) or not np.isfinite(initial_q).all():
+            raise ValueError("--initial-q must contain 14 finite degree values")
+        initial_q = np.clip(initial_q, model.joint_limits[:, 0], model.joint_limits[:, 1])
+    except Exception as exc:
+        print(f"Could not initialize Fairino model: {exc}", file=sys.stderr)
+        return 1
+
+    visualizer = None
+    if not args.no_meshcat:
+        try:
+            from .visualizer import Visualizer
+
+            visualizer = Visualizer(
+                model, args.urdf, None, open_browser=not args.no_open_browser, root_node="fairino"
+            )
+            print(f"MeshCat: {visualizer.url}")
+        except Exception as exc:  # optional visualizer must not block the GUI
+            print(f"MeshCat disabled: {exc}", file=sys.stderr)
+
+    app = qt["QApplication"].instance() or qt["QApplication"](sys.argv)
+    window = FairinoIKWindow.create(
+        qt, model, options, initial_q=initial_q, visualizer=visualizer,
+        ik_update_hz=args.ik_update_hz, smooth_time=args.smooth_time,
+        qp_solver=args.solver,
+    )
+    window.show()
+    if args.no_show:
+        app.processEvents()
+        window.close()
+        return 0
+    return int(app.exec())
+
+
+def main() -> int:
+    reexec_without_ros("fairino_ik.qt")
+    try:
+        return run(_parser().parse_args())
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

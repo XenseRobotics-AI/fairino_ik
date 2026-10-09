@@ -1,0 +1,23 @@
+name: fairinoik
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy>=1.24
+  - pyside6>=6.6,<7
+  - pip
+  - pip:
+      - pin==3.9.0
+      - cmeel-urdfdom==4.0.1
+      - cmeel-tinyxml2==10.0.0
+      - eiquadprog>=1.2.9
+      - pybind11>=2.10
+      - meshcat>=0.3.2
+      - pytest>=7
+      - -e .
+
+variables:
+  PYTHONPATH: ""
+  LD_LIBRARY_PATH: ""
+  AMENT_PREFIX_PATH: ""
+  PYTHONNOUSERSITE: "1"

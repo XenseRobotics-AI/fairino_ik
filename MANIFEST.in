@@ -1,0 +1,3 @@
+include README.md
+recursive-include cpp *.hpp *.cpp
+recursive-include src/fairino_ik/assets/fairino *.urdf *.STL

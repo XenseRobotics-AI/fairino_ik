@@ -1,0 +1,52 @@
+[build-system]
+requires = [
+  "setuptools>=68",
+  "wheel",
+  "pybind11>=2.10",
+  # Pinocchio 3.9.0 was built against urdfdom 4.0 and tinyxml2 10.  The
+  # upstream metadata is lower-bounded only, so an unconstrained install can
+  # otherwise mix urdfdom/tinyxml2 SONAMEs from different ABI generations.
+  "pin==3.9.0",
+  "cmeel-urdfdom==4.0.1",
+  "cmeel-tinyxml2==10.0.0",
+  "eiquadprog>=1.2.9",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fairino-ik"
+version = "0.1.0"
+description = "Dual-arm inverse kinematics and Qt visualization for the Fairino wheel-legged robot"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "pin==3.9.0",
+  "cmeel-urdfdom==4.0.1",
+  "cmeel-tinyxml2==10.0.0",
+  "eiquadprog>=1.2.9",
+  "PySide6>=6.6,<7",
+  "meshcat>=0.3.2",
+  "pytest>=7",
+]
+
+[project.scripts]
+fairino-ik = "fairino_ik.cli:main"
+fairino-ik-qt = "fairino_ik.qt:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fairino_ik = [
+  "assets/fairino/*.urdf",
+  "assets/fairino/meshes/*.STL",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
