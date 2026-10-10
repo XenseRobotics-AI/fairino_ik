@@ -127,7 +127,7 @@ options = IKOptions(posture_weight=1.0, posture_target=home)
 result = model.solve_ik(left_target, right_target, previous_q, options)
 ```
 
-Qt 默认把初始关节值作为家位（`--posture-weight 0` 关闭），IK 页有 "Set home = current joints"
+Qt 默认把初始关节值作为家位（`--posture-weight 0` 关闭），IK 页有 "Set home"
 和 "Go home" 两个按钮；`--home-q` 用度给出家位（14 个，或含躯干的 19 个），同时作为初始位形：
 
 ```bash
@@ -247,9 +247,11 @@ python examples/dual_arm_qt.py --torso 0 0 0 0 0.3 --head 0.2
 python examples/dual_arm_qt.py --no-active-torso  # 只解手臂，躯干锁定（默认手臂+躯干联动）
 ```
 
-界面包含：
+界面（约 850×390 像素）：顶部一行是 MeshCat 地址、Open MeshCat、QP 后端和 Reset；
+下面是 `FK joints`、`IK targets` 两个标签页，`--chassis` 时多一个 `Chassis` 页。
+数值框右侧单独显示单位（deg、m、m/s、rad/s），各页的使用说明在标签页的悬停提示里。
 
-- 左右臂各 7 个关节 FK 滑动条；
+- FK 页：左臂、右臂、躯干/头部三列关节滑动条；
 - 躯干 5 轴 + 头部滑动条（改动后手臂关节不变、IK 目标同步到新的 FK 位姿）。
   `--active-torso` 时躯干滑条就是 q 的一部分，会随 IK 结果更新；
 - 左右末端各自的 XYZ 和旋转目标滑动条。旋转滑条 `rot x/y/z` 是绕世界固定轴、
@@ -259,9 +261,8 @@ python examples/dual_arm_qt.py --no-active-torso  # 只解手臂，躯干锁定�
   躯干 `j20 j19 j18 j16 j15 = [30, 60, 30, 0, 0]`°。仅手臂模式下躯干锁定在这个角度。
   可用 `--home-q`/`--initial-q`/`--torso` 覆盖。全零位是双臂伸直的奇异位形
   （j1/j3/j5 共线，雅可比秩只有 4），不适合作为拖动起点；
-- `Solve left`、`Solve right` 和 `Solve both`；
-- 原生 C++ QP solver 状态与躯干间距；
-- Reset、从当前 FK 写入 IK 目标以及动画显示。
+- IK 页按钮：`Solve left`、`Solve right`、`Solve both`、`Sync from FK`、`Set home`、`Go home`；
+- 求解状态两行：结果、迭代次数（及躯干角度），位置/姿态误差与避碰间距。
 
 求单臂时，另一侧目标会保持当前 FK 位姿，因此仍由同一个双臂 QP 连续求解；
 躯干参与时，躯干移动后另一只手会自动补偿以保持原位。

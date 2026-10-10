@@ -131,6 +131,7 @@ def _load_qt() -> dict[str, Any]:
         from PySide6.QtCore import QSignalBlocker, Qt, QTimer, QUrl
         from PySide6.QtGui import QDesktopServices
         from PySide6.QtWidgets import (
+            QAbstractSpinBox,
             QApplication,
             QComboBox,
             QDoubleSpinBox,
@@ -161,6 +162,21 @@ def _available_qp_solvers() -> list[str]:
     return preferred + [name for name in available if name not in preferred]
 
 
+# Compact layout metrics (pixels).
+_LABEL_WIDTH = 64
+_SPIN_WIDTH = 62
+_UNIT_WIDTH = 30
+_SLIDER_MIN_WIDTH = 90
+
+
+def _compact(layout, margin: int = 4, spacing: int = 2):
+    """Tighten a layout's margins and spacing; returns it for chaining."""
+
+    layout.setContentsMargins(margin, margin, margin, margin)
+    layout.setSpacing(spacing)
+    return layout
+
+
 class SliderControl:
     """Floating-point slider with a synchronized numeric spin box."""
 
@@ -174,7 +190,7 @@ class SliderControl:
         *,
         decimals: int,
         single_step: float,
-        suffix: str,
+        unit: str,
     ) -> None:
         if not minimum < maximum:
             raise ValueError(f"invalid slider range for {label}: {minimum}, {maximum}")
@@ -184,7 +200,7 @@ class SliderControl:
         self._slider_steps = 20_000
         self._callbacks: list[Callable[[float], None]] = []
         self.name_label = qt["QLabel"](label)
-        self.name_label.setMinimumWidth(118)
+        self.name_label.setFixedWidth(_LABEL_WIDTH)
         self.slider = qt["QSlider"](qt["Qt"].Orientation.Horizontal)
         self.slider.setRange(0, self._slider_steps)
         self.slider.setTracking(True)
@@ -192,14 +208,20 @@ class SliderControl:
         self.spin_box.setRange(self._minimum, self._maximum)
         self.spin_box.setDecimals(decimals)
         self.spin_box.setSingleStep(single_step)
-        self.spin_box.setSuffix(suffix)
         self.spin_box.setKeyboardTracking(True)
-        self.spin_box.setMinimumWidth(125)
+        self.spin_box.setButtonSymbols(qt["QAbstractSpinBox"].ButtonSymbols.NoButtons)
+        self.spin_box.setAlignment(qt["Qt"].AlignmentFlag.AlignRight)
+        self.spin_box.setFixedWidth(_SPIN_WIDTH)
+        self.unit_label = qt["QLabel"](unit)
+        self.unit_label.setFixedWidth(_UNIT_WIDTH)
+        self.slider.setMinimumWidth(_SLIDER_MIN_WIDTH)
         layout = qt["QHBoxLayout"]()
-        layout.setContentsMargins(0, 1, 0, 1)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         layout.addWidget(self.name_label)
         layout.addWidget(self.slider, 1)
         layout.addWidget(self.spin_box)
+        layout.addWidget(self.unit_label)
         self.widget = qt["QWidget"]()
         self.widget.setLayout(layout)
         self.slider.valueChanged.connect(self._on_slider)
@@ -260,10 +282,10 @@ class _JointPanel:
         self.qt = qt
         self.controls: list[SliderControl] = []
         group = qt["QGroupBox"](title)
-        layout = qt["QVBoxLayout"](group)
+        layout = _compact(qt["QVBoxLayout"](group))
         joint_names = tuple(joint_names)
         labels = (
-            tuple(f"J{index + 1} {name}" for index, name in enumerate(joint_names))
+            joint_names
             if labels is None else tuple(labels)
         )
         for label, limit in zip(labels, limits, strict=True):
@@ -275,7 +297,7 @@ class _JointPanel:
                 0.0,
                 decimals=2,
                 single_step=0.1,
-                suffix=" deg",
+                unit="deg",
             )
             self.controls.append(control)
             layout.addWidget(control.widget)
@@ -302,12 +324,12 @@ class _PosePanel:
     """
 
     SPECS = (
-        ("x", -1.5, 1.5, 4, 0.001, " m"),
-        ("y", -1.5, 1.5, 4, 0.001, " m"),
-        ("z", 0.0, 2.2, 4, 0.001, " m"),
-        ("rot x", -180.0, 180.0, 2, 0.5, " deg"),
-        ("rot y", -180.0, 180.0, 2, 0.5, " deg"),
-        ("rot z", -180.0, 180.0, 2, 0.5, " deg"),
+        ("x", -1.5, 1.5, 4, 0.001, "m"),
+        ("y", -1.5, 1.5, 4, 0.001, "m"),
+        ("z", 0.0, 2.2, 4, 0.001, "m"),
+        ("rot x", -180.0, 180.0, 2, 0.5, "deg"),
+        ("rot y", -180.0, 180.0, 2, 0.5, "deg"),
+        ("rot z", -180.0, 180.0, 2, 0.5, "deg"),
     )
 
     def __init__(self, qt: dict[str, Any], title: str) -> None:
@@ -315,11 +337,11 @@ class _PosePanel:
         self.controls: dict[str, SliderControl] = {}
         self._reference = np.eye(3)
         group = qt["QGroupBox"](title)
-        layout = qt["QVBoxLayout"](group)
-        for name, minimum, maximum, decimals, step, suffix in self.SPECS:
+        layout = _compact(qt["QVBoxLayout"](group))
+        for name, minimum, maximum, decimals, step, unit in self.SPECS:
             control = SliderControl(
                 qt, name, minimum, maximum, 0.0,
-                decimals=decimals, single_step=step, suffix=suffix,
+                decimals=decimals, single_step=step, unit=unit,
             )
             self.controls[name] = control
             layout.addWidget(control.widget)
@@ -354,7 +376,7 @@ class _PosePanel:
         # Read-only display; near pitch = +-90 deg roll and yaw are ambiguous.
         roll, pitch, yaw = np.degrees(_rpy_from_rotation(self.pose()[:3, :3]))
         self.rpy_label.setText(
-            f"target RPY (display only): {roll:7.2f} {pitch:7.2f} {yaw:7.2f} deg"
+            f"RPY (display): {roll:6.1f} {pitch:6.1f} {yaw:6.1f} deg"
         )
 
 
@@ -366,12 +388,12 @@ _START_TORSO_DEG = (30.0, 60.0, 30.0, 0.0, 0.0)
 
 
 _TORSO_LABELS = (
-    "j20 lower leg",
+    "j20 shin",
     "j19 knee",
     "j18 hip",
     "j16 waist",
-    "j15 body yaw",
-    "j17 head yaw",
+    "j15 yaw",
+    "j17 head",
 )
 
 
@@ -416,9 +438,9 @@ class FairinoIKWindow:
                 self.chassis = chassis
                 # Chassis odometry pose; it only places the robot in MeshCat.
                 self.base = np.zeros(3)
-                self.setWindowTitle("Fairino C++ QP Dual-Arm FK / IK")
-                self.resize(1200, 900)
+                self.setWindowTitle("Fairino FK / IK")
                 self._build_ui()
+                self.adjustSize()
                 self._reset_from_q()
 
                 self.fk_timer = qt["QTimer"](self)
@@ -445,26 +467,20 @@ class FairinoIKWindow:
 
             def _build_ui(self) -> None:
                 central = self.qt["QWidget"]()
-                root = self.qt["QVBoxLayout"](central)
-                title = self.qt["QLabel"]("Fairino 轮腿双臂 FK / IK 滑动条控制")
-                title.setStyleSheet("font-size: 20px; font-weight: 600;")
-                root.addWidget(title)
-                root.addWidget(self.qt["QLabel"](f"URDF: {model.urdf_path}"))
-                mesh_row = self.qt["QHBoxLayout"]()
+                root = _compact(self.qt["QVBoxLayout"](central), 6, 4)
+
+                header = self.qt["QHBoxLayout"]()
+                header.setSpacing(6)
                 self.mesh_label = self.qt["QLabel"](
-                    f"MeshCat: {visualizer.url}" if visualizer is not None else "MeshCat: disabled"
+                    f"MeshCat: {visualizer.url}" if visualizer is not None else "MeshCat: off"
                 )
-                mesh_row.addWidget(self.mesh_label, 1)
+                self.mesh_label.setToolTip(f"URDF: {model.urdf_path}")
+                header.addWidget(self.mesh_label, 1)
                 self.open_mesh_button = self.qt["QPushButton"]("Open MeshCat")
                 self.open_mesh_button.setEnabled(visualizer is not None)
                 self.open_mesh_button.clicked.connect(self._open_meshcat)
-                mesh_row.addWidget(self.open_mesh_button)
-                root.addLayout(mesh_row)
-
-                solver_row = self.qt["QHBoxLayout"]()
-                solver_row.addWidget(self.qt["QLabel"]("IK backend: C++ QP"))
-                solver_row.addStretch(1)
-                solver_row.addWidget(self.qt["QLabel"]("QP solver:"))
+                header.addWidget(self.open_mesh_button)
+                header.addWidget(self.qt["QLabel"]("QP:"))
                 self.qp_solver_combo = self.qt["QComboBox"]()
                 for solver_name in _available_qp_solvers():
                     self.qp_solver_combo.addItem(solver_name, solver_name)
@@ -476,36 +492,32 @@ class FairinoIKWindow:
                 self.qp_solver_combo.currentIndexChanged.connect(
                     self._on_qp_solver_changed
                 )
-                solver_row.addWidget(self.qp_solver_combo)
-                root.addLayout(solver_row)
+                header.addWidget(self.qp_solver_combo)
+                reset = self.qt["QPushButton"]("Reset")
+                reset.setToolTip("Reset targets / sliders from the current joints")
+                reset.clicked.connect(self._reset_from_q)
+                header.addWidget(reset)
+                root.addLayout(header)
 
                 tabs = self.qt["QTabWidget"]()
                 fk_page = self.qt["QWidget"]()
-                fk_layout = self.qt["QVBoxLayout"](fk_page)
-                fk_layout.addWidget(self.qt["QLabel"](
-                    "FK：拖动左右臂关节滑条；Apply FK 会更新两侧末端目标。"
-                    + ("躯干参与 IK 求解，头部锁定；拖动躯干滑条后两侧目标随之同步。"
-                       if model.active_torso else
-                       "躯干/头部在 IK 中锁定，改变后两侧目标随之同步。")
-                ))
+                fk_layout = _compact(self.qt["QVBoxLayout"](fk_page))
                 joint_row = self.qt["QHBoxLayout"]()
+                joint_row.setSpacing(4)
                 limits = np.asarray(model.joint_limits, dtype=float)
-                self.left_joints = _JointPanel(qt, "Left arm joints", model.left_arm_joints, limits[:7])
-                self.right_joints = _JointPanel(qt, "Right arm joints", model.right_arm_joints, limits[7:14])
+                self.left_joints = _JointPanel(qt, "Left arm", model.left_arm_joints, limits[:7])
+                self.right_joints = _JointPanel(qt, "Right arm", model.right_arm_joints, limits[7:14])
                 torso_limits = np.vstack((model.torso_limits, model.head_limits))
                 self.torso_joints = _JointPanel(
                     qt,
-                    "Torso (solved by IK) / head (locked)" if model.active_torso
-                    else "Torso / head (locked during IK)",
+                    "Torso (IK) / head" if model.active_torso else "Torso / head (locked)",
                     TORSO_JOINTS + (HEAD_JOINT,), torso_limits, _TORSO_LABELS,
                 )
                 self.torso_joints.set_q(self._torso_values() + (self.options.head_position,))
                 joint_row.addWidget(self.left_joints.widget)
                 joint_row.addWidget(self.right_joints.widget)
+                joint_row.addWidget(self.torso_joints.widget)
                 fk_layout.addLayout(joint_row)
-                fk_layout.addWidget(self.torso_joints.widget)
-                if self.chassis is not None:
-                    root.addWidget(self._build_chassis_panel())
                 fk_buttons = self.qt["QHBoxLayout"]()
                 apply_left = self.qt["QPushButton"]("Apply left FK")
                 apply_right = self.qt["QPushButton"]("Apply right FK")
@@ -522,34 +534,35 @@ class FairinoIKWindow:
                 self.fk_status.setStyleSheet("font-family: monospace;")
                 fk_layout.addWidget(self.fk_status)
                 fk_layout.addStretch(1)
-                tabs.addTab(fk_page, "FK - joint sliders")
+                fk_index = tabs.addTab(fk_page, "FK joints")
+                tabs.setTabToolTip(
+                    fk_index,
+                    "Drag the joint sliders; Apply FK updates the hand targets. "
+                    + ("The torso is solved by the IK, the head is locked."
+                       if model.active_torso else "The torso and head are locked during IK."),
+                )
 
                 ik_page = self.qt["QWidget"]()
-                ik_layout = self.qt["QVBoxLayout"](ik_page)
-                ik_layout.addWidget(self.qt["QLabel"](
-                    "IK：拖动左/右 XYZ 和旋转滑条；目标相对机械臂基座 base_link（随底盘移动），x 前 / y 左 / z 上，平移单位米。"
-                    "rot x/y/z 是绕世界固定轴、相对上次同步姿态的旋转（度），没有万向锁。"
-                ))
+                ik_layout = _compact(self.qt["QVBoxLayout"](ik_page))
                 pose_row = self.qt["QHBoxLayout"]()
-                self.left_pose = _PosePanel(qt, "Left arm target")
-                self.right_pose = _PosePanel(qt, "Right arm target")
+                pose_row.setSpacing(4)
+                self.left_pose = _PosePanel(qt, "Left target (base_link)")
+                self.right_pose = _PosePanel(qt, "Right target (base_link)")
                 pose_row.addWidget(self.left_pose.widget)
                 pose_row.addWidget(self.right_pose.widget)
                 ik_layout.addLayout(pose_row)
                 self.left_pose.connect(lambda _value: self._schedule_ik("left"))
                 self.right_pose.connect(lambda _value: self._schedule_ik("right"))
                 ik_buttons = self.qt["QHBoxLayout"]()
-                solve_left = self.qt["QPushButton"]("Solve left arm")
-                solve_right = self.qt["QPushButton"]("Solve right arm")
-                solve_both = self.qt["QPushButton"]("Solve both arms")
-                sync = self.qt["QPushButton"]("Sync targets from current FK")
-                home_buttons = self.qt["QHBoxLayout"]()
-                set_home = self.qt["QPushButton"]("Set home = current joints")
+                solve_left = self.qt["QPushButton"]("Solve left")
+                solve_right = self.qt["QPushButton"]("Solve right")
+                solve_both = self.qt["QPushButton"]("Solve both")
+                sync = self.qt["QPushButton"]("Sync from FK")
+                set_home = self.qt["QPushButton"]("Set home")
+                set_home.setToolTip("Use the current joints as the home posture")
                 go_home = self.qt["QPushButton"]("Go home")
                 set_home.clicked.connect(self._set_home)
                 go_home.clicked.connect(self._go_home)
-                home_buttons.addWidget(set_home)
-                home_buttons.addWidget(go_home)
                 self.home_label = self.qt["QLabel"]()
                 self.home_label.setWordWrap(True)
                 self.home_label.setStyleSheet("font-family: monospace;")
@@ -557,12 +570,9 @@ class FairinoIKWindow:
                 solve_right.clicked.connect(lambda: self._solve("right"))
                 solve_both.clicked.connect(lambda: self._solve("both"))
                 sync.clicked.connect(self._reset_from_q)
-                ik_buttons.addWidget(solve_left)
-                ik_buttons.addWidget(solve_right)
-                ik_buttons.addWidget(solve_both)
-                ik_buttons.addWidget(sync)
+                for button in (solve_left, solve_right, solve_both, sync, set_home, go_home):
+                    ik_buttons.addWidget(button)
                 ik_layout.addLayout(ik_buttons)
-                ik_layout.addLayout(home_buttons)
                 ik_layout.addWidget(self.home_label)
                 self._update_home_label()
                 self.ik_status = self.qt["QLabel"]()
@@ -570,11 +580,16 @@ class FairinoIKWindow:
                 self.ik_status.setStyleSheet("font-family: monospace;")
                 ik_layout.addWidget(self.ik_status)
                 ik_layout.addStretch(1)
-                tabs.addTab(ik_page, "IK - XYZ / rotation sliders")
+                ik_index = tabs.addTab(ik_page, "IK targets")
+                tabs.setTabToolTip(
+                    ik_index,
+                    "Targets are relative to base_link: x forward, y left, z up. "
+                    "rot x/y/z rotate about the fixed axes from the last FK sync "
+                    "(no gimbal lock).",
+                )
+                if self.chassis is not None:
+                    tabs.addTab(self._build_chassis_panel(), "Chassis")
                 root.addWidget(tabs, 1)
-                reset = self.qt["QPushButton"]("Reset targets / sliders")
-                reset.clicked.connect(self._reset_from_q)
-                root.addWidget(reset)
                 self.setCentralWidget(central)
                 self.left_joints.connect(lambda _value: self._schedule_fk())
                 self.right_joints.connect(lambda _value: self._schedule_fk())
@@ -582,17 +597,19 @@ class FairinoIKWindow:
 
             def _build_chassis_panel(self):
                 limits = self.chassis.limits
-                group = self.qt["QGroupBox"](
-                    "Chassis (vx, vy, rz) - not part of the IK; base_link and the arms ride on it")
-                layout = self.qt["QVBoxLayout"](group)
+                group = self.qt["QWidget"]()
+                group.setToolTip(
+                    "Chassis velocity command, not part of the IK: base_link, the torso "
+                    "and the arms ride on the chassis.")
+                layout = _compact(self.qt["QVBoxLayout"](group))
                 self.chassis_controls: list[SliderControl] = []
-                for label, limit, suffix in (
-                    ("vx forward", limits.max_vx, " m/s"),
-                    ("vy left", limits.max_vy, " m/s"),
-                    ("rz turn", limits.max_wz, " rad/s"),
+                for label, limit, unit in (
+                    ("vx fwd", limits.max_vx, "m/s"),
+                    ("vy left", limits.max_vy, "m/s"),
+                    ("rz turn", limits.max_wz, "rad/s"),
                 ):
                     control = SliderControl(qt, label, -limit, limit, 0.0, decimals=3,
-                                            single_step=0.01, suffix=suffix)
+                                            single_step=0.01, unit=unit)
                     self.chassis_controls.append(control)
                     layout.addWidget(control.widget)
                 row = self.qt["QHBoxLayout"]()
@@ -606,6 +623,7 @@ class FairinoIKWindow:
                 self.chassis_label = self.qt["QLabel"]()
                 self.chassis_label.setStyleSheet("font-family: monospace;")
                 layout.addWidget(self.chassis_label)
+                layout.addStretch(1)
                 self._update_chassis_label((0.0, 0.0, 0.0))
                 return group
 
@@ -613,8 +631,8 @@ class FairinoIKWindow:
                 vx, vy, rz = command
                 x, y, yaw = self.base
                 self.chassis_label.setText(
-                    f"command: vx={vx:+.3f} m/s  vy={vy:+.3f} m/s  rz={rz:+.3f} rad/s\n"
-                    f"odometry: x={x:+.3f} m  y={y:+.3f} m  yaw={math.degrees(yaw):+.1f} deg"
+                    f"cmd  vx {vx:+.3f} m/s  vy {vy:+.3f} m/s  rz {rz:+.3f} rad/s\n"
+                    f"odom x {x:+.3f} m    y {y:+.3f} m    yaw {math.degrees(yaw):+.1f} deg"
                 )
 
             def _stop_chassis(self) -> None:
@@ -809,17 +827,18 @@ class FairinoIKWindow:
                     if np.isfinite(result.q).all():
                         self._set_goal(result.q, immediate=immediate)
                     torso_text = (
-                        f"torso [deg] = {np.array2string(np.degrees(result.q[14:]), precision=2, suppress_small=True)}\n"
+                        "  torso [deg] "
+                        + np.array2string(np.degrees(result.q[14:]), precision=1,
+                                          suppress_small=True)
                         if model.active_torso else ""
                     )
+                    # Two lines; the joint angles are on the FK tab.  The
+                    # word "success=" is kept for scripts that grep the label.
                     self.ik_status.setText(
-                        torso_text +
-                        f"{side} solve: {result.status}, success={result.success}, "
-                        f"iterations={result.iterations}\n"
-                        f"position={result.position_error:.3e} m, "
-                        f"orientation={result.orientation_error:.3e} rad, "
-                        f"torso clearance={result.body_min_distance:.3f} m\n"
-                        f"arms [deg] = {np.array2string(np.degrees(result.q[:14]), precision=2, suppress_small=True)}"
+                        f"{side}: {result.status}, success={result.success}, "
+                        f"{result.iterations} it{torso_text}\n"
+                        f"pos {result.position_error:.1e} m, rot {result.orientation_error:.1e} rad, "
+                        f"clearance {result.body_min_distance:.3f} m"
                     )
                     self.ik_status.setStyleSheet(
                         "font-family: monospace; color: #1b7f2a;"
@@ -831,12 +850,13 @@ class FairinoIKWindow:
 
             def _update_home_label(self) -> None:
                 if self.options.posture_weight <= 0.0:
-                    self.home_label.setText("Home posture: disabled (--posture-weight 0)")
+                    self.home_label.setText("home posture off (--posture-weight 0)")
                     return
                 home = self.options.posture_target
                 self.home_label.setText(
-                    "Home posture (null-space pull) [deg] = "
-                    + np.array2string(np.degrees(home), precision=1, suppress_small=True)
+                    "home [deg] "
+                    + np.array2string(np.degrees(home), precision=1, suppress_small=True,
+                                      max_line_width=200)
                 )
 
             def _set_home(self) -> None:
