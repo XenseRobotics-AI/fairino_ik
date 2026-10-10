@@ -2,7 +2,7 @@
 """Slider-based Qt control panel for C++ QP Fairino dual-arm IK.
 
 The FK tab contains seven joint sliders for each arm plus the torso/head
-joints, which stay locked during IK.  The IK tab contains independent XYZ and
+joints (the torso is solved by the IK unless --no-active-torso).  The IK tab contains independent XYZ and
 rotation sliders and separate left/right/both solve buttons.  Joint angles are
 shown in degrees.
 
@@ -14,9 +14,8 @@ singularity inside the slider range.
 
 Examples::
 
-    python examples/dual_arm_qt.py
-    python examples/dual_arm_qt.py --no-meshcat
     python examples/dual_arm_qt.py                     # arms + torso (default)
+    python examples/dual_arm_qt.py --no-meshcat
     python examples/dual_arm_qt.py --no-active-torso   # arms only, torso locked
     python examples/dual_arm_qt.py --chassis           # plus (vx, vy, rz) chassis
     python examples/dual_arm_qt.py \
@@ -862,73 +861,137 @@ class FairinoIKWindow:
         return _Window()
 
 
+_HELP_DESCRIPTION = """\
+Fairino wheel-legged dual-arm FK/IK slider panel (C++ Pinocchio + eiquadprog QP).
+
+Modes (the two switches combine):
+  fairino-ik-qt                               arms + torso IK (19 DoF, default)
+  fairino-ik-qt --no-active-torso             arms only (14 DoF), torso locked at --torso
+  fairino-ik-qt --chassis                     arms + torso IK, plus the chassis panel
+  fairino-ik-qt --chassis --no-active-torso   arms only, plus the chassis panel
+
+The chassis (--chassis) is not part of the IK: it is driven by vx/vy/rz, and
+base_link, the torso and both arms ride on it, so the joints and IK targets do
+not change while it drives.  IK targets are always relative to base_link
+(x forward, y left, z up)."""
+
+_HELP_EPILOG = """\
+Default initial pose = default home posture (degrees):
+  left arm -30 45 0 60 0 0 0, right arm 30 45 0 60 0 0 0,
+  torso j20 j19 j18 j16 j15 = 30 60 30 0 0
+  The redundant joints are pulled towards the home posture in the null space
+  of the hand targets; "Set home" / "Go home" on the IK tab set and recall it.
+
+Examples:
+  fairino-ik-qt                               # arms + torso IK (default)
+  fairino-ik-qt --no-active-torso             # arms only, torso locked
+  fairino-ik-qt --chassis                     # arms + torso IK, plus the chassis panel
+  fairino-ik-qt --chassis --no-active-torso   # arms only, plus the chassis panel
+  fairino-ik-qt --chassis --chassis-max-velocity 0.3 0.3 0.4
+  fairino-ik-qt --home-q 0 45 0 90 0 45 0  0 45 0 90 0 45 0  0 0 0 0 0
+  fairino-ik-qt --no-meshcat
+  QT_QPA_PLATFORM=offscreen fairino-ik-qt --no-show      # headless self-check"""
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
-    parser.add_argument("--left-frame", default=DEFAULT_LEFT_FRAME)
-    parser.add_argument("--right-frame", default=DEFAULT_RIGHT_FRAME)
-    parser.add_argument(
-        "--urdf-base-frame", action="store_true",
-        help="use raw base_link axes (forward is -y) instead of x forward",
+    parser = argparse.ArgumentParser(
+        prog="fairino-ik-qt",
+        description=_HELP_DESCRIPTION,
+        epilog=_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--max-iterations", type=int, default=500)
-    parser.add_argument("--tolerance", type=float, default=1e-5)
-    parser.add_argument("--damping", type=float, default=1e-5)
-    parser.add_argument(
-        "--posture-weight", "--posture-cost", dest="posture_weight", type=float, default=1.0,
-        help="null-space pull towards the home posture (0 disables)",
+    mode = parser.add_argument_group("mode")
+    mode.add_argument(
+        "--active-torso", action=argparse.BooleanOptionalAction, default=True,
+        help="let the IK move the torso (default; it only moves when the arms cannot "
+        "reach); --no-active-torso locks it at --torso",
     )
-    parser.add_argument("--posture-gain", type=float, default=1.0)
-    parser.add_argument(
+    mode.add_argument(
+        "--chassis", action="store_true",
+        help="show the chassis panel driven by vx/vy/rz; the chassis is not part of the IK",
+    )
+
+    pose = parser.add_argument_group("initial pose and home posture")
+    pose.add_argument(
         "--home-q", type=float, nargs="+", metavar="DEG", default=None,
-        help="home posture in degrees: 14 arm joints, or 19 with the torso "
+        help="home posture in degrees: 14 arm joints, or 5 more for the torso "
         + " ".join(TORSO_JOINTS) + "; also the initial pose unless --initial-q is given",
     )
-    parser.add_argument(
-        "--velocity-limit", type=float, default=float(np.pi),
-        help="arm joint speed in rad/s (the URDF limits are zero)",
+    pose.add_argument(
+        "--initial-q", type=float, nargs=14, metavar="DEG", default=None,
+        help="initial arm joints in degrees, left j1..j7 then right j8..j14",
     )
-    parser.add_argument(
-        "--torso", type=float, nargs=len(TORSO_JOINTS), metavar="RAD",
-        default=None,
-        help="initial torso joints " + " ".join(TORSO_JOINTS)
-        + " in radians (default: 30 60 30 0 0 deg)",
+    pose.add_argument(
+        "--torso", type=float, nargs=len(TORSO_JOINTS), metavar="RAD", default=None,
+        help="initial torso " + " ".join(TORSO_JOINTS) + " in radians (default 30 60 30 0 0 deg)",
     )
-    parser.add_argument("--head", type=float, default=0.0, help="initial head yaw j17 (radians)")
-    parser.add_argument("--no-body-avoidance", action="store_true")
-    parser.add_argument(
-        "--active-torso", action=argparse.BooleanOptionalAction, default=True,
-        help="let the IK move the torso with the arms (default); --no-active-torso "
-        "locks it at --torso",
+    pose.add_argument("--head", type=float, default=0.0,
+                      help="head yaw j17 in radians (always locked)")
+    pose.add_argument(
+        "--posture-weight", "--posture-cost", dest="posture_weight", type=float, default=1.0,
+        help="null-space pull towards the home posture (default 1, 0 disables it)",
     )
-    parser.add_argument(
-        "--chassis", action="store_true",
-        help="add a chassis panel driven by (vx, vy, rz); the chassis is not part of the IK",
-    )
-    parser.add_argument(
+    pose.add_argument("--posture-gain", type=float, default=1.0,
+                      help="fraction of the null-space home offset removed per iteration "
+                      "(default 1)")
+
+    chassis = parser.add_argument_group("chassis (--chassis)")
+    chassis.add_argument(
         "--chassis-max-velocity", type=float, nargs=3, metavar=("VX", "VY", "RZ"),
-        default=(0.5, 0.5, 0.5), help="chassis velocity limits in m/s, m/s, rad/s",
+        default=(0.5, 0.5, 0.5), help="velocity limits in m/s, m/s, rad/s (default 0.5 0.5 0.5)",
     )
-    parser.add_argument(
+    chassis.add_argument(
         "--chassis-max-acceleration", type=float, nargs=3, metavar=("AX", "AY", "AW"),
-        default=(1.0, 1.0, 1.0), help="chassis acceleration limits (0 disables an axis limit)",
+        default=(1.0, 1.0, 1.0),
+        help="acceleration limits (default 1 1 1; 0 leaves an axis unlimited)",
     )
-    parser.add_argument(
+
+    solver = parser.add_argument_group("IK solver")
+    solver.add_argument("--max-iterations", type=int, default=500,
+                        help="maximum iterations per solve (default 500)")
+    solver.add_argument("--tolerance", type=float, default=1e-5,
+                        help="position (m) / orientation (rad) tolerance (default 1e-5)")
+    solver.add_argument("--damping", type=float, default=1e-5, help="damping (default 1e-5)")
+    solver.add_argument(
+        "--velocity-limit", type=float, default=float(np.pi),
+        help="arm joint speed limit in rad/s (the URDF limits are 0; default pi)",
+    )
+    solver.add_argument(
         "--arms-first-iterations", type=int, default=50,
-        help="iterations with the torso fixed before it is freed (0: free at once)",
+        help="iterations with the arms alone before the torso is freed "
+        "(default 50; 0 solves jointly from the start)",
     )
-    parser.add_argument("--torso-step-weight", type=float, default=0.0)
-    parser.add_argument(
-        "--solver",
-        default="eiquadprog",
-        help="native C++ backend shown initially in the GUI (default: eiquadprog)",
+    solver.add_argument("--torso-step-weight", type=float, default=0.0,
+                        help="extra cost on torso steps (default 0)")
+    solver.add_argument("--no-body-avoidance", action="store_true",
+                        help="disable arm vs. torso/chassis collision avoidance")
+    solver.add_argument("--solver", default="eiquadprog", help="QP backend (eiquadprog only)")
+
+    model = parser.add_argument_group("model and frames")
+    model.add_argument("--urdf", type=Path, default=DEFAULT_URDF,
+                       help="URDF path (default: the packaged model)")
+    model.add_argument("--left-frame", default=DEFAULT_LEFT_FRAME,
+                       help=f"left end-effector frame (default {DEFAULT_LEFT_FRAME}; "
+                       "left_flange is also available)")
+    model.add_argument("--right-frame", default=DEFAULT_RIGHT_FRAME,
+                       help=f"right end-effector frame (default {DEFAULT_RIGHT_FRAME}; "
+                       "right_flange is also available)")
+    model.add_argument(
+        "--urdf-base-frame", action="store_true",
+        help="use the raw URDF base_link axes (forward is -y) instead of x forward",
     )
-    parser.add_argument("--ik-update-hz", type=float, default=30.0)
-    parser.add_argument("--smooth-time", type=float, default=0.12)
-    parser.add_argument("--initial-q", type=float, nargs=14, metavar="DEG", default=None)
-    parser.add_argument("--no-meshcat", action="store_true")
-    parser.add_argument("--no-open-browser", action="store_true")
-    parser.add_argument("--no-show", action="store_true")
+
+    display = parser.add_argument_group("GUI and display")
+    display.add_argument("--ik-update-hz", type=float, default=30.0,
+                         help="IK / chassis control rate while dragging (default 30 Hz)")
+    display.add_argument("--smooth-time", type=float, default=0.12,
+                         help="joint animation smoothing time in s (default 0.12, 0 disables)")
+    display.add_argument("--no-meshcat", action="store_true", help="do not start MeshCat 3D view")
+    display.add_argument("--no-open-browser", action="store_true",
+                         help="start MeshCat without opening a browser")
+    display.add_argument("--no-show", action="store_true",
+                         help="build the window and exit (with QT_QPA_PLATFORM=offscreen "
+                         "for a self-check)")
     return parser
 
 
