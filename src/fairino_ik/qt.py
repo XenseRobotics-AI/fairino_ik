@@ -16,7 +16,9 @@ Examples::
 
     python examples/dual_arm_qt.py
     python examples/dual_arm_qt.py --no-meshcat
-    python examples/dual_arm_qt.py --active-torso    # IK also moves the torso
+    python examples/dual_arm_qt.py                     # arms + torso (default)
+    python examples/dual_arm_qt.py --no-active-torso   # arms only, torso locked
+    python examples/dual_arm_qt.py --chassis           # plus (vx, vy, rz) chassis
     python examples/dual_arm_qt.py \
         --home-q 0 45 0 90 0 45 0  0 45 0 90 0 45 0  0 0 0 0 0
 
@@ -28,6 +30,11 @@ disables this).  "Set home" stores the current joints as the new home.
 
 For a headless construction check, use ``QT_QPA_PLATFORM=offscreen`` together
 with ``--no-show``.  A normal desktop session is required for interaction.
+
+``--chassis`` adds a chassis panel driven by (vx, vy, rz) commands.  The
+chassis is not part of the IK: the arm base (base_link) rides on the chassis,
+the IK targets stay in base_link, and driving never changes the arm or torso
+joints.  The chassis only moves the whole robot in the odometry frame.
 """
 
 from __future__ import annotations
@@ -43,6 +50,12 @@ from typing import Any, Callable, Iterable
 import numpy as np
 
 
+from .chassis import (
+    ChassisController,
+    ChassisLimits,
+    integrate_twist,
+    planar_matrix,
+)
 from .solver import (
     DEFAULT_LEFT_FRAME,
     DEFAULT_RIGHT_FRAME,
@@ -377,6 +390,7 @@ class FairinoIKWindow:
         ik_update_hz: float = 30.0,
         smooth_time: float = 0.12,
         qp_solver: str = "eiquadprog",
+        chassis: ChassisController | None = None,
     ):
         class _Window(qt["QMainWindow"]):
             def __init__(self) -> None:
@@ -399,6 +413,10 @@ class FairinoIKWindow:
                 self.display_q = self.goal_q.copy()
                 self._animation_start = self.display_q.copy()
                 self._animation_started = time.monotonic()
+                # Chassis odometry pose (x, y, yaw); stays zero without --chassis.
+                self.chassis = chassis
+                # Chassis odometry pose; it only places the robot in MeshCat.
+                self.base = np.zeros(3)
                 self.setWindowTitle("Fairino C++ QP Dual-Arm FK / IK")
                 self.resize(1200, 900)
                 self._build_ui()
@@ -412,6 +430,11 @@ class FairinoIKWindow:
                 self.torso_timer.setSingleShot(True)
                 self.torso_timer.setInterval(20)
                 self.torso_timer.timeout.connect(self._apply_torso_from_sliders)
+                self.chassis_timer = qt["QTimer"](self)
+                self.chassis_timer.setInterval(max(1, round(1000.0 / self.ik_update_hz)))
+                self.chassis_timer.timeout.connect(self._chassis_step)
+                if self.chassis is not None:
+                    self.chassis_timer.start()
                 self.ik_timer = qt["QTimer"](self)
                 self.ik_timer.setSingleShot(True)
                 self.ik_timer.setInterval(max(1, round(1000.0 / self.ik_update_hz)))
@@ -482,6 +505,8 @@ class FairinoIKWindow:
                 joint_row.addWidget(self.right_joints.widget)
                 fk_layout.addLayout(joint_row)
                 fk_layout.addWidget(self.torso_joints.widget)
+                if self.chassis is not None:
+                    root.addWidget(self._build_chassis_panel())
                 fk_buttons = self.qt["QHBoxLayout"]()
                 apply_left = self.qt["QPushButton"]("Apply left FK")
                 apply_right = self.qt["QPushButton"]("Apply right FK")
@@ -503,7 +528,7 @@ class FairinoIKWindow:
                 ik_page = self.qt["QWidget"]()
                 ik_layout = self.qt["QVBoxLayout"](ik_page)
                 ik_layout.addWidget(self.qt["QLabel"](
-                    "IK：拖动左/右 XYZ 和旋转滑条；坐标 x 前 / y 左 / z 上，平移单位米。"
+                    "IK：拖动左/右 XYZ 和旋转滑条；目标相对机械臂基座 base_link（随底盘移动），x 前 / y 左 / z 上，平移单位米。"
                     "rot x/y/z 是绕世界固定轴、相对上次同步姿态的旋转（度），没有万向锁。"
                 ))
                 pose_row = self.qt["QHBoxLayout"]()
@@ -556,10 +581,77 @@ class FairinoIKWindow:
                 self.right_joints.connect(lambda _value: self._schedule_fk())
                 self.torso_joints.connect(lambda _value: self._schedule_torso())
 
+            def _build_chassis_panel(self):
+                limits = self.chassis.limits
+                group = self.qt["QGroupBox"](
+                    "Chassis (vx, vy, rz) - not part of the IK; base_link and the arms ride on it")
+                layout = self.qt["QVBoxLayout"](group)
+                self.chassis_controls: list[SliderControl] = []
+                for label, limit, suffix in (
+                    ("vx forward", limits.max_vx, " m/s"),
+                    ("vy left", limits.max_vy, " m/s"),
+                    ("rz turn", limits.max_wz, " rad/s"),
+                ):
+                    control = SliderControl(qt, label, -limit, limit, 0.0, decimals=3,
+                                            single_step=0.01, suffix=suffix)
+                    self.chassis_controls.append(control)
+                    layout.addWidget(control.widget)
+                row = self.qt["QHBoxLayout"]()
+                stop = self.qt["QPushButton"]("Stop chassis")
+                stop.clicked.connect(self._stop_chassis)
+                reset = self.qt["QPushButton"]("Reset odometry")
+                reset.clicked.connect(self._reset_odometry)
+                row.addWidget(stop)
+                row.addWidget(reset)
+                layout.addLayout(row)
+                self.chassis_label = self.qt["QLabel"]()
+                self.chassis_label.setStyleSheet("font-family: monospace;")
+                layout.addWidget(self.chassis_label)
+                self._update_chassis_label((0.0, 0.0, 0.0))
+                return group
+
+            def _update_chassis_label(self, command) -> None:
+                vx, vy, rz = command
+                x, y, yaw = self.base
+                self.chassis_label.setText(
+                    f"command: vx={vx:+.3f} m/s  vy={vy:+.3f} m/s  rz={rz:+.3f} rad/s\n"
+                    f"odometry: x={x:+.3f} m  y={y:+.3f} m  yaw={math.degrees(yaw):+.1f} deg"
+                )
+
+            def _stop_chassis(self) -> None:
+                for control in self.chassis_controls:
+                    control.set_value(0.0)
+
+            def _reset_odometry(self) -> None:
+                self._stop_chassis()
+                self.chassis.reset()
+                self.base = np.zeros(3)
+                self._sync_targets()
+                self._update_view(self.display_q)
+                self._update_chassis_label((0.0, 0.0, 0.0))
+
+            def _chassis_step(self) -> None:
+                """One chassis cycle: limit the request and integrate odometry.
+
+                The arm base rides on the chassis, so the arm/torso joints and
+                the base_link IK targets are left untouched.
+                """
+                dt = 1.0 / self.ik_update_hz
+                request = [control.value() for control in self.chassis_controls]
+                command = self.chassis.teleop(request, dt).as_tuple()
+                self._update_chassis_label(command)
+                if not any(command):
+                    return
+                self.base = integrate_twist(self.base, command, dt)
+                self._update_view(self.display_q)
+
             def _update_view(self, q: np.ndarray) -> None:
                 if self.visualizer is not None:
                     try:
-                        self.visualizer.update(q, self.options)
+                        self.visualizer.update(
+                            q, self.options,
+                            planar_matrix(self.base) if self.chassis is not None else None,
+                        )
                     except Exception as exc:  # pragma: no cover
                         self.mesh_label.setText(f"MeshCat update failed: {exc}")
 
@@ -699,7 +791,7 @@ class FairinoIKWindow:
                 else:
                     self._solve("both")
 
-            def _solve(self, side: str) -> None:
+            def _solve(self, side: str, *, immediate: bool = False) -> None:
                 try:
                     left_target = self.left_pose.pose()
                     right_target = self.right_pose.pose()
@@ -716,7 +808,7 @@ class FairinoIKWindow:
                         solver=self.qp_solver,
                     )
                     if np.isfinite(result.q).all():
-                        self._set_goal(result.q)
+                        self._set_goal(result.q, immediate=immediate)
                     torso_text = (
                         f"torso [deg] = {np.array2string(np.degrees(result.q[14:]), precision=2, suppress_small=True)}\n"
                         if model.active_torso else ""
@@ -805,8 +897,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--head", type=float, default=0.0, help="initial head yaw j17 (radians)")
     parser.add_argument("--no-body-avoidance", action="store_true")
     parser.add_argument(
-        "--active-torso", action="store_true",
-        help="let the IK move the torso too (19 DoF); --torso is then the initial torso",
+        "--active-torso", action=argparse.BooleanOptionalAction, default=True,
+        help="let the IK move the torso with the arms (default); --no-active-torso "
+        "locks it at --torso",
+    )
+    parser.add_argument(
+        "--chassis", action="store_true",
+        help="add a chassis panel driven by (vx, vy, rz); the chassis is not part of the IK",
+    )
+    parser.add_argument(
+        "--chassis-max-velocity", type=float, nargs=3, metavar=("VX", "VY", "RZ"),
+        default=(0.5, 0.5, 0.5), help="chassis velocity limits in m/s, m/s, rad/s",
+    )
+    parser.add_argument(
+        "--chassis-max-acceleration", type=float, nargs=3, metavar=("AX", "AY", "AW"),
+        default=(1.0, 1.0, 1.0), help="chassis acceleration limits (0 disables an axis limit)",
     )
     parser.add_argument(
         "--arms-first-iterations", type=int, default=50,
@@ -905,10 +1010,15 @@ def run(args: argparse.Namespace) -> int:
             print(f"MeshCat disabled: {exc}", file=sys.stderr)
 
     app = qt["QApplication"].instance() or qt["QApplication"](sys.argv)
+    chassis = None
+    if args.chassis:
+        vx, vy, wz = args.chassis_max_velocity
+        ax, ay, aw = args.chassis_max_acceleration
+        chassis = ChassisController(ChassisLimits(vx, vy, wz, ax, ay, aw))
     window = FairinoIKWindow.create(
         qt, model, options, initial_q=initial_q, visualizer=visualizer,
         ik_update_hz=args.ik_update_hz, smooth_time=args.smooth_time,
-        qp_solver=args.solver,
+        qp_solver=args.solver, chassis=chassis,
     )
     window.show()
     if args.no_show:

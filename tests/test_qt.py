@@ -150,3 +150,43 @@ def test_qt_home_buttons() -> None:
     assert np.allclose(window.goal_q, home)
     app.processEvents()
     window.close()
+
+
+def test_qt_chassis_moves_the_robot_but_not_the_arms() -> None:
+    from fairino_ik import ChassisController
+
+    qt = _load_qt()
+    app = QApplication.instance() or QApplication([])
+    model = FairinoQPModel(active_torso=True)
+    home = np.radians([-30, 45, 0, 60, 0, 0, 0, 30, 45, 0, 60, 0, 0, 0, 30, 60, 30, 0, 0])
+    window = FairinoIKWindow.create(
+        qt, model, IKOptions(posture_weight=1.0), initial_q=home, visualizer=None,
+        smooth_time=0.0, chassis=ChassisController(),
+    )
+    assert model.nq == 19  # the IK never sees the chassis
+    left_target = window.left_pose.pose()
+
+    window.chassis_controls[0].set_value(0.3)
+    window.chassis_controls[2].set_value(0.4)
+    for _ in range(50):
+        window._chassis_step()
+    assert window.base[0] > 0.05 and window.base[2] > 0.05
+    # Driving changes neither the arm/torso joints nor the base_link targets.
+    assert np.array_equal(window.goal_q, home)
+    assert np.array_equal(window.left_pose.pose(), left_target)
+
+    # Arm + torso IK still works while the chassis is away from the origin.
+    for panel in (window.left_pose, window.right_pose):
+        target = panel.pose()
+        target[:3, 3] += [0.2, 0.0, -0.5]
+        panel.set_pose(target)
+    window._solve("both")
+    assert "success=True" in window.ik_status.text(), window.ik_status.text()
+    assert np.abs(window.goal_q[14:] - home[14:]).max() > np.radians(2.0)
+
+    window._stop_chassis()
+    for _ in range(100):
+        window._chassis_step()
+    assert window.chassis.last_command == (0.0, 0.0, 0.0)
+    app.processEvents()
+    window.close()

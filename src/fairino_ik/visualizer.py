@@ -291,12 +291,15 @@ class Visualizer:
     def url(self) -> str:
         return str(self._viewer.url())
 
-    def update(self, q: Sequence[float], options: Any = None) -> None:
+    def update(self, q: Sequence[float], options: Any = None, root_pose: Any = None) -> None:
         """Display a fourteen-joint left-plus-right arm configuration.
 
         ``options`` supplies the locked torso/head joints; the default
         :class:`fairino_ik.IKOptions` shows the upright zero torso.
+        ``root_pose`` (4x4) places the whole robot, e.g. the chassis
+        odometry pose from :func:`fairino_ik.chassis.planar_matrix`.
         """
+        root = np.eye(4) if root_pose is None else np.asarray(root_pose, dtype=float)
         configuration = np.asarray(q, dtype=float)
         if configuration.shape != (int(self.model.nq),):
             raise ValueError(
@@ -324,7 +327,7 @@ class Visualizer:
                     f"got {world_from_link.shape}"
                 )
             self._viewer[f"{self._root_node}/{visual.node_name}"].set_transform(
-                world_from_link @ visual.local_transform
+                root @ world_from_link @ visual.local_transform
             )
         if missing:
             names = ", ".join(sorted(missing))

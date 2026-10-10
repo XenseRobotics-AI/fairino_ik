@@ -135,6 +135,47 @@ fairino-ik-qt --active-torso    # 默认家位就是上面的初始位形
 fairino-ik-qt --active-torso --home-q 0 45 0 90 0 45 0  0 45 0 90 0 45 0  0 0 0 0 0
 ```
 
+## 底盘（vx, vy, rz），不参与 IK
+
+底盘在单独的 `fairino_ik.chassis` 模块里，IK 求解器完全不涉及底盘：IK 只解手臂（和躯干），
+目标都在机器人坐标系下。底盘控制器只输出车体坐标系的速度
+`(vx, vy, rz)`（m/s、m/s、rad/s，x 前、y 左），舵轮逆解交给底盘控制器。
+
+| 接口 | 作用 |
+| --- | --- |
+| `ChassisController(ChassisLimits(...))` | 速度限幅（三轴等比例缩放，保持方向）+ 加速度限幅 |
+| `controller.teleop((vx, vy, rz), dt)` | 摇杆/上层给的速度经限幅后输出 |
+| `controller.command(odom_pose, goal_pose, dt)` | 按 SE(2) 误差的比例控制开向目标位姿，`reached` 表示到达 |
+| `controller.stop(dt)` | 按加速度限制减速到 0 |
+| `integrate_twist(pose, twist, dt)` / `body_twist(p0, p1, dt)` | SE(2) 精确积分 / 反算速度 |
+| `world_to_robot(T, odom_pose)` / `robot_to_world(T, odom_pose)` | 手的目标在里程计坐标系和机器人坐标系之间换算 |
+| `base_goal_for_hands(left_w, right_w, left_ref, right_ref)` | 求一个底盘位姿，使两只手的世界目标落在参考手位（如家位 FK）上 |
+
+默认限幅 0.5 m/s、0.5 m/s、0.5 rad/s，加速度 1 m/s²、1 m/s²、1 rad/s²，需按实车修改。
+
+**机械臂基座在哪**：IK 的目标始终相对 `base_link`（x 前、y 左、z 上）。`base_link` 和
+躯干、双臂都装在底盘上，跟着底盘一起移动。所以底盘行驶时手臂和躯干关节不动，
+`base_link` 下的 IK 目标也不变，IK 不需要重新求解。
+
+```python
+controller = ChassisController()
+while running:
+    cmd = controller.teleop(joystick_twist, dt)   # 或 controller.command(odom, goal, dt)
+    send_chassis_velocity(*cmd.as_tuple())        # 只发给底盘，与 IK 无关
+    # 手臂/躯干照常：目标在 base_link 下
+    result = model.solve_ik(left_target, right_target, q, options)
+```
+
+只有当上层希望手停在世界里某个固定位置时，才需要用 `world_to_robot(T_world, odom)`
+把世界目标换算成 `base_link` 目标再交给 IK；这是可选的，默认不做。
+
+Qt：`fairino-ik-qt --chassis`。底盘面板有 vx/vy/rz 滑条、Stop chassis、Reset odometry，
+显示限幅后的速度指令和积分得到的里程计位姿；MeshCat 里整车（含 `base_link`、躯干、手臂）
+一起移动，手臂和躯干关节保持不变。IK 页的目标始终是 `base_link` 坐标。
+`--chassis-max-velocity`、`--chassis-max-acceleration` 设置限幅。
+
+Qt 默认就是手臂 + 躯干联动求解（19 维）；`--no-active-torso` 只解手臂、躯干锁定在 `--torso`。
+
 ## 躯干避碰
 
 与 tron2-ik 的中心立柱避碰对应，这里检查手臂和机身之间的碰撞：
@@ -203,7 +244,7 @@ fairino-ik-qt
 python examples/dual_arm_qt.py
 python examples/dual_arm_qt.py --no-meshcat
 python examples/dual_arm_qt.py --torso 0 0 0 0 0.3 --head 0.2
-python examples/dual_arm_qt.py --active-torso     # IK 同时求解躯干
+python examples/dual_arm_qt.py --no-active-torso  # 只解手臂，躯干锁定（默认手臂+躯干联动）
 ```
 
 界面包含：
@@ -321,7 +362,7 @@ QT_QPA_PLATFORM=offscreen pytest -q tests/test_qt.py
 ```
 
 测试覆盖模型资源、关节分组、14/19/32 维映射、世界坐标系朝向、躯干锁定、法兰帧、双臂 FK→C++ QP IK、
-手臂优先的躯干 IK、躯干/底盘避碰、批量接口以及 Qt 离屏构造。
+手臂优先的躯干 IK、躯干/底盘避碰、批量接口、独立于 IK 的底盘 (vx, vy, rz) 控制以及 Qt 离屏构造。
 
 ## 目录
 
